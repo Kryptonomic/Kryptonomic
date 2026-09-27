@@ -1,0 +1,32 @@
+{
+  "_comment": "Settings for strategy/COPY_TRADE_PLAN.md. Field names are generic; map them to your bot's settings.",
+  "target_wallet": "ffQUA7xYw32XT9Kjgak5pekN3hSLAgUyhSdYkUMGdmd",
+  "buy": {
+    "copy_buys": true,
+    "copy_adds": true,
+    "size_mode": "multiplier",
+    "size_multiplier": 1.0,
+    "first_week_size_multiplier": 0.5,
+    "max_sol_per_coin": "most you can afford to lose on one coin",
+    "max_slippage_pct": 5,
+    "skip_if_price_above_his_fill_pct": 5,
+    "priority": "high (Jito tip / turbo)",
+    "stop_adding_after_initials_taken": true
+  },
+  "sell": {
+    "copy_sells": true,
+    "copy_sell_mode": "same_percentage_of_position",
+    "copy_on_token_transfer_out": true,
+    "take_initials": {
+      "enabled": true,
+      "trigger_multiple_of_avg_entry": 2.0,
+      "amount": "sell enough to recover SOL spent, minus SOL already returned by copied sells"
+    },
+    "trailing_stop": null,
+    "stop_loss": null
+  },
+  "risk": {
+    "daily_loss_limit_sol": 1.0,
+    "pause_or_halve_size_when_target_7d_pnl_negative": true
+  }
+}
