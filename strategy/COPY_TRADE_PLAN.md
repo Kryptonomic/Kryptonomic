@@ -59,6 +59,22 @@ prices. Includes 1% bot fee per swap and 0.003 SOL priority fee per tx.
 - **The plan tracks his form:** week 1 (he lost): plan -4.6 SOL. Week 2 (he won): plan +3.6 SOL.
 - **2x size, no cap** at +1%: +1.7 SOL over two weeks, but -8.6 in week 1 and +8.2 in week 2.
 
+### With a zero-fee bot (pump fees only)
+
+Pump's fees are already in his fill prices, so the only extra costs are slippage and priority fees.
+
+| Size | Setup | Entry +1% | Entry +2% |
+|---|---|---|---|
+| 1.0x | pure copy | -3.2 | -4.7 |
+| 1.0x | **plan (copy + 2x initials)** | **+1.4** | **+0.3** |
+| 1.15x | pure copy | -3.5 | -5.2 |
+| 1.15x | **plan** | **+1.8** | **+0.5** |
+| 2.1x | pure copy | -5.2 | -8.3 |
+| 2.1x | **plan** | **+4.5** | **+2.2** |
+
+Him over the same period: -0.2 SOL. Plan at 1.0x/+1%, Sep 23-27: +6.2 SOL.
+Run with `--fee 0` to reproduce.
+
 ### Other variants tested (for the record)
 
 | Variant | 2 weeks @+1% | NEARCAT @+2% (him: +1.65) |
