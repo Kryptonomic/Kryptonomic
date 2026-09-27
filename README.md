@@ -12,5 +12,5 @@ python3 backtest/backtest.py --slip 0.01 --mult 1.0
 python3 backtest/backtest.py --wallet <address>
 ```
 
-Standard library only. The first run downloads data into `.cache/` (a few minutes; public RPC
+Standard library only. Set `HELIUS_API_KEY` to fetch through Helius instead of the rate-limited public RPC. The first run downloads data into `.cache/` (a few minutes; public RPC
 and GeckoTerminal are rate-limited), and later runs reuse it. Delete `.cache/` to refresh.

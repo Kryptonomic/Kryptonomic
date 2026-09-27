@@ -9,12 +9,15 @@ GeckoTerminal, then replays the plan minute by minute.
     python3 backtest/backtest.py --wallet <addr> --slip 0.02 --mult 1.0
     python3 backtest/backtest.py --cache .cache        # reuse downloaded data
 
+Set HELIUS_API_KEY in the environment to use Helius RPC (much faster, no rate-limit stalls).
+
 Only the Python standard library is needed.
 """
 import argparse, collections, json, os, time, urllib.error, urllib.request
 
 WALLET = "ffQUA7xYw32XT9Kjgak5pekN3hSLAgUyhSdYkUMGdmd"
-RPC = "https://api.mainnet.solana.com"
+RPC = (f"https://mainnet.helius-rpc.com/?api-key={os.environ['HELIUS_API_KEY']}"
+       if os.environ.get("HELIUS_API_KEY") else "https://api.mainnet.solana.com")
 WSOL = "So11111111111111111111111111111111111111112"
 USD_MINTS = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
              "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}   # USDT
@@ -60,7 +63,7 @@ def fetch_txs(wallet, limit):
             "encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
         if n % 50 == 0:
             print(f"  fetched {n}/{len(sigs)} transactions", flush=True)
-        time.sleep(0.15)
+        time.sleep(0.02 if os.environ.get("HELIUS_API_KEY") else 0.15)
     return out
 
 
