@@ -265,7 +265,7 @@ class StrategySpec:
     tp1_frac: float = 0.5                # 0.05..1.0 fraction closed at tp1
     tp2_ext: float = 1.618               # > tp1_ext, <= 4.236 (ignored if tp1_frac == 1)
     move_stop_to_be: bool = True         # after tp1, stop -> breakeven incl. fees (active from next bar)
-    trail_atr: float = 0.0               # 0 disables; else trail remainder after tp1 at close - k*ATR
+    trail_atr: float = 0.0               # 0..10; 0 disables; else trail remainder after tp1 at close - k*ATR
     max_hold_bars: int = 120             # 1..2000 time stop
     min_rr: float = 1.5                  # 0..10 planned (blended) reward/risk at arming
 
@@ -277,9 +277,17 @@ class StrategySpec:
     def with_overrides(self, **kw) -> "StrategySpec"
 ```
 
+Construction normalizes numbers so equal specs share a spec_id: ints in float fields become floats,
+floats are rounded to 10 decimals, integral floats in int fields become ints. `from_dict` and
+`with_overrides` only parse (unknown keys -> ValueError); `validate()` (also run by
+`FibEngine.__init__`) checks types, ranges and the cross-field rules.
+
 `PARAM_SPACE: dict[str, dict]` — for every field except name: `{"type": "int"|"float"|"bool"|"choice",
-"min", "max", "step" (numeric), "choices" (choice), "default", "doc"}`. `step` is used for robustness
-neighbours. `PRESETS: dict[str, StrategySpec]` — at least:
+"min", "max", "step" (numeric), "choices" (choice), "default", "doc"}`. min/max are the field-comment
+ranges (stop_ratio 0.25..1.2, tp2_ext 0.3..4.236); cross-field rules are only checked by `validate()`.
+`step` is used for robustness neighbours. `PRESETS: dict[str, StrategySpec]` (shared instances: derive
+with `with_overrides`, never mutate) — at least the rows below; parameters a row does not mention keep
+their defaults, and a stop given without "+xATR" means `stop_atr_buffer=0`:
 
 | preset | idea |
 |---|---|
@@ -309,7 +317,17 @@ class FibEngine:
         # strategy_id defaults to spec.spec_id()
     def run(self, bars: Bars, trade_start_t: int | None = None,
             skip_legs: frozenset[str] | set[str] = frozenset()) -> RunResult
+        # ValueError if bars.tf != spec.timeframe; empty bars -> empty RunResult. skip_legs holds
+        # leg_ids of THIS symbol (None = empty). No warmup gating inside: only nan indicators and
+        # trade_start_t gate trading (callers prepend warmup_bars).
 ```
+
+Indicators: ATR is Wilder `atr(h, l, c, swing_atr_len)` everywhere (atr-mode pivots, min_leg_atr,
+stop buffer, trailing, meta "atr"); ADX and RSI use n=14.
+
+**Unknown intrabar order is resolved against the trade.** OHLC does not say whether a bar's low came
+before or after its high, so an ambiguous bar never creates an entry: the bar that sets a new extreme
+still kills the leg if its low reaches the new stop, but is never a confirm-mode touch.
 
 **Determinism and causality (hard requirements, tested):** decisions made at the close of bar i use
 only bars <= i; orders placed at the close of bar i can only fill on bars >= i+1. Consequence:
@@ -322,11 +340,13 @@ earlier output.
    - open position (entered before i): manage exits (below);
    - pending limit order: long fills if `l[i] <= px` at `min(o[i], px)` (short: `h[i] >= px` at
      `max(o[i], px)`), no slippage. If both a long and a short limit would fill, fill the one whose
-     price is closer to o[i] and cancel the other;
+     order price is closer to o[i] and cancel the other (an exact tie fills the long; since
+     long px < c[i-1] < short px, this is the order the open gapped through, else the nearer one);
    - pending market order (confirm mode): fills at `o[i] * (1 + side*slippage)`;
-   - on the entry bar, after the fill: if the fill price is already beyond the stop, exit immediately
-     at the fill price (with slippage, reason "stop"); else if the bar's range reaches the stop
-     (`l[i] <= stop` long / `h[i] >= stop` short) exit at the stop with slippage (reason "stop").
+   - on the entry bar, after the fill: let `x` = the worse of o[i] and the fill price (long: min,
+     short: max), i.e. the fill's price before entry slippage. If `x` is at or beyond the stop, exit
+     immediately at `x * (1 - side*slippage)` (reason "stop"); else if the bar's range reaches the
+     stop (`l[i] <= stop` long / `h[i] >= stop` short) exit at the stop with slippage (reason "stop").
      **Targets are never credited on the entry bar.** Mark the leg used.
 2. *Close of bar i*: update the pivot tracker; update both side setups; trailing stop and time stop
    for an open position; then (if flat) place orders for bar i+1.
@@ -339,12 +359,13 @@ earlier output.
 - The leg is skipped/dead when: leg_id in used legs or skip_legs; price traded below the anchor
   after the anchor (`min low over (anchor.idx, i] < anchor.price`); or `i - ext_idx > setup_expiry_bars`
   while unfilled; or the low of bar i is <= the leg's stop price while unfilled (price ran through the
-  stop). A dead leg is added to used legs.
+  stop; checked on every bar the leg is evaluated, including the bar that confirms the anchor or sets a
+  new extreme, with the stop recomputed from that extreme). A dead leg is added to used legs.
 - It *qualifies* at bar i when: `extreme - anchor.price >= min_leg_atr * atr[i]`; the trend filter
   passes **evaluated at ext_idx** (long: `ema`: c > EMA(trend_ema); `ema_slope`: c > EMA and
   EMA[ext_idx] > EMA[ext_idx-10]; `ema_stack`: EMA(50) > EMA(trend_ema) and c > EMA(50); `none`: pass;
-  nan fails); `adx[ext_idx] >= adx_min` (when adx_min > 0); structure filter if enabled; and the
-  reward/risk check passes.
+  nan fails); `adx[ext_idx] >= adx_min` (when adx_min > 0); structure filter if enabled (fails when
+  there is no previous confirmed pivot of that kind); and the reward/risk check passes.
 - Levels: `retrace(r) = retrace_price(anchor, extreme, r)`, `ext(e) = extension_price(anchor, extreme, e)`.
   zone_top = retrace(entry_zone_lo) (shallow), zone_bottom = retrace(entry_zone_hi) (deep).
   entry ratio = lo | (lo+hi)/2 | hi per entry_at; entry_px = retrace(entry ratio).
@@ -353,15 +374,22 @@ earlier output.
   RR = (tp1_frac*(tp1-entry) + (1-tp1_frac)*(tp2-entry)) / (entry-stop) (short: signs flipped);
   requires entry > stop, tp1 > entry and RR >= min_rr. (If tp1_frac == 1, RR uses tp1 only.)
 - The first bar at which a leg qualifies emits a `Signal` (entry_px, stop_px, tp1, tp2, meta with
-  anchor, extreme, atr, rr, mode).
+  anchor, extreme, atr, rr, mode, plus anchor_t, ext_t, leg_size and zone = [zone_top, zone_bottom]),
+  whether or not an order is placed (flat or in a position, c[i] on either side of entry_px);
+  entry_px is the nominal entry in both modes. Dead legs and legs in skip_legs never signal.
+  `Trade.setup_t` is that bar's t, also when the signal window hid the Signal.
 - **limit mode**: when flat and the leg qualifies, place a limit at entry_px for bar i+1 only if
-  `c[i] > entry_px` (short: `c[i] < entry_px`). Orders are re-computed every bar (the extreme may move).
-- **confirm mode**: the leg is *touched* at bar j when `l[j] <= zone_top` and `l[j] > stop_px`.
-  Within `confirm_window` bars after the touch (j..j+window), a confirmation at the close of bar k
-  places a market order for bar k+1 if the leg still qualifies with entry = c[k]:
+  `c[i] > entry_px` (short: `c[i] < entry_px`). Orders are re-computed every bar (the extreme may move;
+  the Signal keeps its arming-time prices).
+- **confirm mode**: the leg is *touched* at bar j when `j > ext_idx` (see intrabar order above), the
+  leg qualifies at j, `l[j] <= zone_top` and `l[j] > stop_px`. A new extreme clears the touch (the
+  zone moved). Within `confirm_window` bars after the touch (j..j+window, k == j allowed), a
+  confirmation at the close of bar k places a market order for bar k+1 if the leg still qualifies
+  with entry = c[k]:
   `reclaim`: c[k] > zone_top and c[k] > o[k]; `engulf`: c[k] > o[k], c[k-1] < o[k-1], c[k] >= o[k-1],
   o[k] <= c[k-1]; `rsi`: rsi[k-1] < 40 and rsi[k] > rsi[k-1]. No confirmation in the window ->
-  untouched again (can be re-touched later).
+  untouched again (can be re-touched later). At each close: an expired touch (i - j > window) is
+  cleared first, then bar i may register a new touch, then the confirmation is checked.
 - Stop/targets/anchor/extreme are frozen into the position at fill time.
 
 **Position management on bars after the entry bar** (long; short mirrors):
@@ -374,25 +402,36 @@ earlier output.
 5. At the close: if trail_atr > 0 and tp1_hit: stop = max(stop, c - trail_atr*atr). If
    `i - entry_idx >= max_hold_bars`: exit the remainder at `c*(1-slippage)` (reason "time").
 Exit reason when a stop fills: "stop" if the stop was never moved, "breakeven" if it was moved to
-breakeven and not trailed above it, "trail" if trailed above breakeven.
+breakeven and not trailed above it, "trail" if the trailing stop raised it (above breakeven, or above
+the initial stop when move_stop_to_be is off). A nan ATR does not trail.
 
 **Accounting.** Fills k with fractions f_k (sum 1) at prices p_k; entry fill P (incl. slippage), fee
 rate f:
 - long: `ret_pct = sum(f_k*p_k)/P*(1-f) - (1+f)`; short: `ret_pct = (1-f) - sum(f_k*p_k)/P*(1+f)`.
-- `risk_pct = |P - initial_stop| / P`; `r_multiple = ret_pct / risk_pct`; exit_price = sum(f_k*p_k).
+- `risk_pct = |P - initial_stop| / P`; `r_multiple = ret_pct / risk_pct` (0 if risk_pct == 0);
+  exit_price = sum(f_k*p_k); `Trade.stop_price` is the initial stop.
 - `bars_held = exit_idx - entry_idx`; exit_t = t[exit_idx].
 - meta: {"anchor", "extreme", "leg_size", "atr", "entry_ratio", "tp1", "tp2", "rr",
-  "fills": [[frac, price, reason, t], ...], "entry_mode"}.
+  "fills": [[frac, price, reason, t], ...], "entry_mode"}. tp1/tp2 are the frozen targets; atr/rr are
+  from the bar the order was placed; confirm-mode entry_ratio is the retracement ratio of c[k]. Fill
+  reasons: "tp1", "tp2", "stop" | "breakeven" | "trail", "time", "open"; exit_reason "target" when tp1
+  (tp1_frac == 1) or tp2 closes the trade.
 - An open position at the last bar is reported as `open_trade` marked at c[-1] (with exit costs and
-  slippage), exit_reason "open", exit_t None.
+  slippage), exit_reason "open", exit_t None: its fills are the realized partials plus the mark
+  `[remainder, c[-1]*(1 - side*slippage), "open", t[-1]]`, and bars_held = (n-1) - entry_idx.
 
 ```python
 def manage_position(bars: Bars, atr: list[float], entry_idx: int, side: int, entry_px: float,
                     stop_px: float, tp1: float, tp2: float, spec: StrategySpec, costs: Costs,
                     start_mgmt_idx: int | None = None) -> dict
     # Pure helper implementing "position management" + accounting from entry_idx onward (used by the
-    # random baseline). Returns {"exit_idx", "exit_reason", "fills", "ret_pct", "risk_pct", "r_multiple",
-    # "open": bool}. FibEngine must use the same per-bar exit logic (shared code, not a copy).
+    # random baseline). Returns {"exit_idx", "exit_reason", "fills", "exit_price", "ret_pct", "risk_pct",
+    # "r_multiple", "open": bool}. FibEngine must use the same per-bar exit logic (shared code, not a copy).
+    # atr = ATR(swing_atr_len) aligned with bars (only trailing reads it). start_mgmt_idx (default
+    # entry_idx) is the first bar processed: bar entry_idx gets only the entry-bar stop check (x = the
+    # worse of o and entry_px); a later start skips the entry bar and every bar before it, and the time
+    # stop still counts from entry_idx. ValueError: side not +/-1, entry_idx outside bars,
+    # start_mgmt_idx < entry_idx.
 ```
 
 ## fibbot/backtest.py
@@ -463,7 +502,8 @@ trades never change; new bars only add/close trades. This guarantees backtest/pa
 ```python
 class PaperTrader:
     def __init__(self, cfg, store: Store, candles: CandleStore)
-    def tick(self, update_data: bool = True, now_t: int | None = None) -> dict
+    def tick(self, update_data: bool = True, now_t: int | None = None, universe: list[str] | None = None) -> dict
+        # universe defaults to get_universe(cfg) (the scheduler passes the list it already has).
         # For each roster strategy (status "paper"): optionally candles.update_all(universe, {tf});
         # run engine per symbol in get_universe(cfg) (skip_legs = store.vetoed_legs(...) only when
         # cfg.brain.signal_review == "active"); upsert every trade (closed + open);
@@ -476,7 +516,11 @@ class PaperTrader:
         #  "stats": trade_stats(closed), "max_drawdown", "open_positions": [...]}
 ```
 The universe for a strategy is `get_universe(cfg)` at tick time (cached list), so the paper universe
-can change when the market-cap ranking changes; trades already recorded are kept.
+can change when the market-cap ranking changes; trades already recorded are kept. Honesty rules:
+a symbol that joins after the strategy's first tick trades only from the bar forming when it joined
+(no hindsight back-fill; join times in kv `paper_universe:{sid}`); a symbol that leaves is still
+replayed while the account holds a position in it (no new trades or signals); closed paper trades
+are final; in "active" review mode a veto only blocks legs without a recorded trade.
 
 ## fibbot/graduation.py
 
@@ -508,6 +552,7 @@ class Lab:
     def windows(self, tf: str = "4h") -> dict
     # budgets (per brain cycle; CLI runs are unbudgeted unless begin_cycle was called)
     def begin_cycle(self, kind: str) -> None      # resets counters from cfg.research
+    def end_cycle(self) -> None                   # back to unbudgeted "cli" mode (cycles call it in finally)
     def budget(self) -> dict                      # {"backtest_units_left", "validations_left"} (None = unlimited)
     # research (records experiments + trials; source = "brain" inside a cycle else "cli")
     def backtest(self, spec: StrategySpec | dict, window="research", symbols=None) -> dict   # summary + folds + experiment_id
@@ -538,8 +583,9 @@ Units: `backtest` = 1, `robustness` = number of neighbours, `optimize` = number 
 
 ```python
 def sweep(lab, presets: list[str] | None = None, promote: bool = False) -> dict
-    # evaluate every preset on the research window (+ baseline, fold stability), rank by avg_r among those
-    # with >= research.min_trades and fold_positive_frac >= 0.5 and beating the baseline; validate the top 3;
+    # evaluate presets (default: those whose timeframe is in data.timeframes) on the research window
+    # (+ baseline, fold stability), rank by avg_r among those with >= research.min_trades, avg_r > 0,
+    # fold_positive_frac >= 0.5 and beating the baseline (edge_r > 0); validate the top 3;
     # optionally promote passing ones (respecting max_roster). Returns a ranking table + validations.
 ```
 
@@ -592,10 +638,17 @@ def run_once(cfg, now_t=None, use_brain=True, lab=None, brain=None) -> dict
     # universe refresh if stale -> candles.update_all(universe, tfs needed by roster or data.timeframes)
     # -> paper tick -> brain.review_signals (if mode != off and brain available) -> graduation for each
     # roster strategy (journal status changes; auto-retire if paper drawdown > 1.5 * graduation.max_drawdown)
-    # -> review cycle if due -> research cycle if due or roster empty (brain available) else
+    # -> review cycle if due -> research cycle if due (brain available) else
     # autopilot.sweep(promote=True) when the roster is empty -> write_report. Exceptions in any step are
     # journaled (kind "system") and do not abort later steps.
-def run_forever(cfg, use_brain=True) -> None   # loop: sleep until next tf boundary + tick_offset_seconds, run_once
+    # Research is due after brain.research_every_hours, or after brain.review_every_hours while the roster
+    # is empty (not on every pass: each cycle costs money and validation tries). A brain cycle that started
+    # after the last completed one (kv last_{kind}_attempt_t > last_{kind}_t: it failed or crashed) is
+    # retried only CYCLE_RETRY_HOURS (6) after it started. The scheduler never sets status "graduated"
+    # (that would stop the paper replay); it journals graduation status changes instead.
+def run_forever(cfg, use_brain=True) -> None
+    # one pass now, then a pass at every UTC multiple of tick_every_seconds + tick_offset_seconds until
+    # SIGINT/SIGTERM (the first signal stops after the current step)
 ```
 CLI: `python -m fibbot <command>` with global `--config PATH --home DIR`. Commands: `universe [--refresh]`,
 `data [--tf ...] [--symbols ...]`, `presets`, `backtest (--preset N | --spec JSON_OR_FILE) [--window]

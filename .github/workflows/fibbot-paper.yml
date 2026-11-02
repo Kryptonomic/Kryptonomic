@@ -1,0 +1,138 @@
+# fibbot paper trading on GitHub Actions: one bot cycle per hour. PAPER ONLY - no live trading.
+#
+# Setup (Settings > Secrets and variables > Actions):
+#   - variable FIBBOT_ENABLED = true        (required; the job is skipped otherwise)
+#   - secret   ANTHROPIC_API_KEY            (optional; without it the bot runs without the brain)
+#   - variable FIBBOT_CONFIG = path/to.json (optional; a committed config file)
+#
+# State (.fibbot/ minus candles and logs) is kept on the orphan branch "fibbot-state" as ONE
+# squashed commit that is force-pushed every run, so that branch never accumulates history.
+# Candles are kept in the Actions cache instead (they are large and can be re-downloaded).
+name: fibbot paper trading
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # hourly, a few minutes after the candle close
+  workflow_dispatch:
+
+concurrency:
+  group: fibbot-paper
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tick:
+    if: vars.FIBBOT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # a first run downloads years of candles; a research cycle can be long
+    defaults:
+      run:
+        shell: bash        # explicit bash = "bash --noprofile --norc -eo pipefail"
+    env:
+      FIBBOT_HOME: ${{ github.workspace }}/.fibbot
+      FIBBOT_CONFIG: ${{ vars.FIBBOT_CONFIG }}
+      STATE_BRANCH: fibbot-state
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state from the fibbot-state branch
+        run: |
+          mkdir -p "$FIBBOT_HOME"
+          rc=0
+          git ls-remote --exit-code --heads origin "$STATE_BRANCH" > /dev/null || rc=$?
+          if [ "$rc" -eq 2 ]; then
+            echo "No $STATE_BRANCH branch yet: starting with an empty state directory."
+          elif [ "$rc" -ne 0 ]; then
+            # Never start from empty state on a network error: the save step would overwrite it.
+            echo "::error::Could not check origin for the $STATE_BRANCH branch (git exit $rc)."
+            exit 1
+          else
+            git fetch --no-tags --depth=1 origin "$STATE_BRANCH"
+            git archive --format=tar FETCH_HEAD | tar -x -C "$FIBBOT_HOME" --anchored --exclude=candles
+            ls -la "$FIBBOT_HOME"
+          fi
+
+      # restore/save are the two halves of actions/cache@v4. The save is a separate step so the
+      # candles are kept even when one bot step failed (plain actions/cache saves on success only).
+      - name: Restore the candle cache
+        id: candles
+        uses: actions/cache/restore@v4
+        with:
+          path: .fibbot/candles
+          key: fibbot-candles-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fibbot-candles-
+
+      # "run --once" exits 1 when any step of the pass failed (each step is isolated and the
+      # database stays consistent), so the steps below still run after a failure: state that
+      # cost API tokens (signal reviews, research cycles) is never thrown away. The job is
+      # still marked failed so you notice.
+      - name: Run one bot cycle
+        id: bot
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            python -m fibbot run --once
+          else
+            unset ANTHROPIC_API_KEY
+            echo "::notice::ANTHROPIC_API_KEY secret is not set: running without the Claude brain."
+            python -m fibbot run --once --no-brain
+          fi
+
+      - name: Show the report in the run summary
+        if: ${{ !cancelled() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure') }}
+        run: |
+          if [ -f "$FIBBOT_HOME/REPORT.md" ]; then
+            head -c 900000 "$FIBBOT_HOME/REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save state to the fibbot-state branch (one squashed commit)
+        if: ${{ !cancelled() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure') }}
+        run: |
+          # Fold each SQLite write-ahead log into its database so the commit is self-contained.
+          python - <<'EOF'
+          import glob, os, sqlite3, sys
+          for db in glob.glob(os.path.join(os.environ["FIBBOT_HOME"], "*.sqlite")):
+              con = sqlite3.connect(db)
+              busy = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+              con.close()
+              if busy:
+                  sys.exit(f"checkpoint of {db} was blocked")
+          EOF
+
+          # Stage .fibbot/ into a throw-away index (the checkout and its index stay untouched),
+          # then write a parentless commit and force-push it as the whole branch.
+          export GIT_DIR="$GITHUB_WORKSPACE/.git" GIT_WORK_TREE="$FIBBOT_HOME"
+          export GIT_INDEX_FILE="$RUNNER_TEMP/fibbot-state.index"
+          rm -f "$GIT_INDEX_FILE"
+          cd "$FIBBOT_HOME"
+          git add --all --force -- . ':(exclude)candles' ':(exclude)*.log' \
+            ':(exclude)*.sqlite-wal' ':(exclude)*.sqlite-shm'
+          if [ -z "$(git ls-files)" ]; then
+            echo "::warning::State directory is empty; not overwriting the $STATE_BRANCH branch."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tree=$(git write-tree)
+          commit=$(git commit-tree "$tree" \
+            -m "fibbot state $(date -u +%Y-%m-%dT%H:%M:%SZ) (run $GITHUB_RUN_ID)")
+          git push --force origin "$commit:refs/heads/$STATE_BRANCH"
+
+      - name: Save the candle cache
+        if: ${{ !cancelled() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure') }}
+        uses: actions/cache/save@v4
+        with:
+          path: .fibbot/candles
+          key: ${{ steps.candles.outputs.cache-primary-key }}

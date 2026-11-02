@@ -1,0 +1,12 @@
+# Keep the build context small and free of local state and secrets.
+.git
+.github
+.fibbot
+.cache
+__pycache__
+**/__pycache__
+**/*.pyc
+.pytest_cache
+tests
+fibbot.json
+.env

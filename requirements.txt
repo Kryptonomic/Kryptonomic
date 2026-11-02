@@ -1,0 +1,5 @@
+# fibbot's core (data, engine, backtests, paper trading, gates) is Python standard library only
+# (Python >= 3.10). The one dependency below is needed ONLY for the Claude brain (fibbot/brain/).
+# Without it, or without an ANTHROPIC_API_KEY, the bot still runs: paper trading and graduation
+# work as usual and research falls back to the deterministic preset sweep (autopilot).
+anthropic>=2.4.0

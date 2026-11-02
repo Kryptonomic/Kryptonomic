@@ -1,0 +1,12 @@
+{
+  "universe": {
+    "top_n": 10
+  },
+  "portfolio": {
+    "risk_per_trade": 0.0025
+  },
+  "brain": {
+    "signal_review": "shadow",
+    "effort": "medium"
+  }
+}
