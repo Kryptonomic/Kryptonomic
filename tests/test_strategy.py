@@ -337,7 +337,8 @@ class TestLongScenarios(FillsMixin, unittest.TestCase):
         self.assertFills(tr.meta["fills"], [(1.0, STOP * (1 - SLIP), "stop", 10)])
 
     def test_entry_bar_targets_never_credited(self):
-        # the entry bar reaches tp1 too, but targets only count from the next bar
+        # the entry bar's high reaches tp1 too, but it may have come before the fill and the bar
+        # closes below tp1, so nothing is credited (a close beyond a target is: test_review_engine)
         r = run(HEAD + [(99.5, 111, 97, 104)])
         self.assertEqual(r.trades, [])
         self.assertEqual(r.open_trade.meta["fills"][0][2], "open")
@@ -347,7 +348,11 @@ class TestLongScenarios(FillsMixin, unittest.TestCase):
         self.assertEqual(tr.entry_price, 92.0)                  # limit gapped through: fill at open
         self.assertEqual((tr.exit_reason, tr.bars_held), ("stop", 0))
         self.assertFills(tr.meta["fills"], [(1.0, 92 * (1 - SLIP), "stop", 10)])
-        self.assertAlmostEqual(tr.risk_pct, (STOP - 92) / 92, places=12)
+        # the fill is below the stop, so |P - stop| / P would be the distance on the wrong side
+        # (R = -0.25% / 0.3% here, arbitrary): R is measured against the order's planned risk
+        risk = (ENTRY - STOP) / ENTRY
+        self.assertAlmostEqual(tr.risk_pct, risk, places=12)
+        self.assertAlmostEqual(tr.r_multiple, tr.ret_pct / risk, places=12)
 
     def test_breakeven_after_tp1_from_next_bar(self):
         # bar 12 fills tp1 and trades below the breakeven level (but above the stop): no exit yet
@@ -694,7 +699,9 @@ class TestCausalityAndProperties(unittest.TestCase):
                               ref.setup_t), k)
 
     def test_long_short_mirror_symmetry_without_costs(self):
-        zero = Costs(0.0, 0.0)
+        # no frictions at all: a relative trade-through (px * (1 -/+ limit_through)) is not
+        # symmetric under the price reflection k - p, so it is switched off here too
+        zero = Costs(0.0, 0.0, 0.0)
         for name in ("limit_both", "confirm_reclaim_both", "confirm_rsi_both", "trail_runner_both"):
             for seed in (4, 5):
                 with self.subTest(spec=name, seed=seed):
@@ -734,7 +741,17 @@ class TestCausalityAndProperties(unittest.TestCase):
                     fills = tr.meta["fills"]
                     self.assertAlmostEqual(sum(f for f, *_ in fills), 1.0, places=12)
                     self.assertAlmostEqual(tr.exit_price, sum(f * p for f, p, *_ in fills), places=9)
-                    self.assertAlmostEqual(tr.risk_pct, abs(tr.entry_price - tr.stop_price) / tr.entry_price)
+                    risk = tr.side * (tr.entry_price - tr.stop_price) / tr.entry_price
+                    o_e = bars.o[idx[tr.entry_t]]
+                    x = min(o_e, tr.entry_price) if tr.side > 0 else max(o_e, tr.entry_price)
+                    if tr.side * (x - tr.stop_price) <= 0:
+                        # filled at or beyond the stop (pre-slippage): R uses the planned risk
+                        m = tr.meta
+                        plan = m["extreme"] - m["entry_ratio"] * (m["extreme"] - m["anchor"])
+                        risk = tr.side * (plan - tr.stop_price) / plan
+                        self.assertEqual((tr.exit_reason, tr.bars_held), ("stop", 0))
+                    self.assertGreater(risk, 0)
+                    self.assertAlmostEqual(tr.risk_pct, risk)
                     self.assertAlmostEqual(tr.r_multiple, tr.ret_pct / tr.risk_pct)
                     ret = (long_ret if tr.side > 0 else short_ret)([(f, p) for f, p, *_ in fills], tr.entry_price)
                     self.assertAlmostEqual(tr.ret_pct, ret, places=12)

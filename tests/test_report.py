@@ -19,7 +19,9 @@ def section(text: str, heading: str) -> str:
 class ReportCase(LabCase):
     def setUp(self):
         super().setUp()
-        record_validation(self.store, SPEC, avg_r=0.3)
+        # validated just before the promotion at NOW (years ago in real time, so it does not
+        # count against research.max_validations_per_week in the budget lines below)
+        record_validation(self.store, SPEC, avg_r=0.3, now_t=NOW - 60)
         self.sid = self.lab.promote(SPEC, NAME, "test", now_t=NOW)["strategy_id"]
         start = self.store.get_strategy(self.sid)["paper_start_t"]
         for k in range(20):
@@ -57,7 +59,11 @@ class TestWriteReport(ReportCase):
         marks = re.findall(r"^- \[([x ])\] (\w+):", checks, re.M)
         self.assertEqual(marks, [("x" if c["passed"] else " ", c["name"]) for c in grad["checks"]])
         self.assertIn(("x", "max_drawdown"), marks)
-        self.assertIn("- [ ] min_days: 10 (threshold 60)", checks)
+        # F33: the fixture's candles end before the paper start, so no paper day counts yet
+        days = next(c for c in grad["checks"] if c["name"] == "min_days")
+        self.assertEqual(days["value"], 0.0)
+        self.assertIn("- [ ] min_days: days up to the newest bar", checks)
+        self.assertIn("10.0 calendar days", checks)
 
         trades = section(text, "Recent paper trades").strip().splitlines()
         self.assertEqual(len(trades), 2 + RECENT_TRADES)                    # header, rule, rows

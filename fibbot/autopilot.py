@@ -18,31 +18,52 @@ MIN_FOLD_POSITIVE = 0.5        # eligible: share of research folds with mean R >
 
 def _row(name: str, bt: dict, base: dict, min_trades: int) -> dict:
     """Ranking row; eligible = enough trades, positive mean R, stable across folds and beating
-    random entries (a preset that loses money is never worth a validation try)."""
+    random entries (a preset that loses money is never worth a validation try). edge_r is the
+    binding edge: min(uniform, regime-filtered) of the baseline (either alone can be lenient; the
+    same rule Lab.promote applies)."""
     m = bt["metrics"]
+    edge = min(base["edge_r"], base.get("edge_regime_r", base["edge_r"]))
     return {"preset": name, "spec_id": bt["spec_id"], "timeframe": bt["timeframe"], "n": m["n"],
             "avg_r": m["avg_r"], "profit_factor": m["profit_factor"],
-            "fold_positive_frac": bt["fold_positive_frac"], "edge_r": base["edge_r"],
+            "fold_positive_frac": bt["fold_positive_frac"], "edge_r": edge,
             "eligible": (m["n"] >= min_trades and m["avg_r"] > 0
-                         and bt["fold_positive_frac"] >= MIN_FOLD_POSITIVE and base["edge_r"] > 0)}
+                         and bt["fold_positive_frac"] >= MIN_FOLD_POSITIVE and edge > 0)}
+
+
+def _num(x, fmt: str) -> str:
+    return "-" if x is None else fmt.format(x)
 
 
 def _journal_body(out: dict) -> str:
-    """One bullet line per ranked preset, validation, promotion and error (plain text that also
-    reads as a Markdown list)."""
-    lines = [f"- {r['preset']} ({r['timeframe']}): n {r['n']}, mean R {r['avg_r']:+.3f},"
-             f" PF {r['profit_factor']:.2f}, positive folds {r['fold_positive_frac']:.2f},"
-             f" edge vs random {r['edge_r']:+.3f} R: {'eligible' if r['eligible'] else 'not eligible'}"
-             for r in out["ranking"]]
+    """One bullet line per validation, promotion, error, skipped preset and ranked preset, in
+    that order (outcomes first, so a clipped report still shows them; plain text that also reads
+    as a Markdown list)."""
+    lines = []
     for v in out["validations"]:
-        lines.append(f"- validation {v['preset']}: {'PASS' if v['passed'] else 'FAIL'} (n {v['n']},"
-                     f" mean R {v['avg_r']:+.3f}, PF {v['profit_factor']:.2f},"
-                     f" deflated Sharpe {v['deflated_sharpe']:.2f})"
+        kept = f"kept from experiment {v['experiment_id']}: " if v.get("reused") else ""
+        lines.append(f"- validation {v['preset']}: {'PASS' if v['passed'] else 'FAIL'} ({kept}n {v['n']},"
+                     f" mean R {_num(v['avg_r'], '{:+.3f}')}, PF {_num(v['profit_factor'], '{:.2f}')},"
+                     f" deflated Sharpe {_num(v['deflated_sharpe'], '{:.2f}')})"
                      + (f"; failed {', '.join(v['failed'])}" if v["failed"] else ""))
     lines += [f"- promoted {p['preset']} ({p['strategy_id']}), paper from {p['paper_start']}"
               for p in out["promoted"]]
     lines += [f"- {e['step']} {e['preset']} failed: {e['error']}" for e in out["errors"]]
+    lines += [f"- not validated {s['preset']}: {s['reason']}" for s in out.get("skipped", [])]
+    lines += [f"- {r['preset']} ({r['timeframe']}): n {r['n']}, mean R {r['avg_r']:+.3f},"
+              f" PF {r['profit_factor']:.2f}, positive folds {r['fold_positive_frac']:.2f},"
+              f" edge vs random {r['edge_r']:+.3f} R: {'eligible' if r['eligible'] else 'not eligible'}"
+              for r in out["ranking"]]
     return "\n".join(lines)
+
+
+def _validation_row(preset: str, spec_id: str, m: dict, eid, reused: bool) -> dict:
+    """Sweep validation row from validate experiment metrics (a new or an earlier validation)."""
+    checks = m.get("checks") or []
+    return {"preset": preset, "spec_id": spec_id, "passed": m.get("passed") is True, "n": m.get("n"),
+            "avg_r": m.get("avg_r"), "profit_factor": m.get("profit_factor"),
+            "deflated_sharpe": m.get("deflated_sharpe"),
+            "failed": [c["name"] for c in checks if not c.get("passed")],
+            "experiment_id": eid, "reused": reused}
 
 
 def sweep(lab: Lab, presets: list[str] | None = None, promote: bool = False) -> dict:
@@ -54,10 +75,16 @@ def sweep(lab: Lab, presets: list[str] | None = None, promote: bool = False) -> 
     (no data, budget, roster full) are listed in "errors". Recorded as a "sweep" experiment and a
     "research" journal entry; kv "last_sweep_t" is set.
 
+    The locked window is never re-drawn: an eligible preset whose recorded validation overlaps
+    the current validation window (Lab.prior_validation) keeps that verdict ("reused": true, no
+    new validation, it may still be promoted when it passed); presets already on the roster or
+    retired are not validated; new validations stop at Lab.weekly_validations_left(). Those
+    left out are listed in "skipped" ({preset, reason}).
+
     Returns {"as_of", "presets", "ranking": [{preset, spec_id, timeframe, n, avg_r, profit_factor,
     fold_positive_frac, edge_r, eligible}], "validations": [{preset, spec_id, passed, n, avg_r,
-    profit_factor, deflated_sharpe, failed, experiment_id}], "promoted": [...], "errors":
-    [{preset, step, error}], "experiment_id"}.
+    profit_factor, deflated_sharpe, failed, experiment_id, reused}], "promoted": [...], "errors":
+    [{preset, step, error}], "skipped": [{preset, reason}], "experiment_id"}.
     """
     tfs = set(lab.cfg["data"]["timeframes"])
     names = ([n for n, s in PRESETS.items() if s.timeframe in tfs] if presets is None
@@ -66,7 +93,7 @@ def sweep(lab: Lab, presets: list[str] | None = None, promote: bool = False) -> 
     if unknown:
         raise ValueError(f"unknown presets {unknown}; known: {sorted(PRESETS)}")
     min_trades = int(lab.cfg["research"]["min_trades"])
-    rows, validations, promoted, errors = [], [], [], []
+    rows, validations, promoted, errors, skipped = [], [], [], [], []
     for name in names:
         try:
             bt = lab.backtest(PRESETS[name], "research")
@@ -77,18 +104,41 @@ def sweep(lab: Lab, presets: list[str] | None = None, promote: bool = False) -> 
         rows.append(_row(name, bt, base, min_trades))
     rows.sort(key=lambda r: (not r["eligible"], -r["avg_r"]))       # stable: ties keep preset order
 
-    for row in [r for r in rows if r["eligible"]][:TOP_VALIDATE]:
-        try:
-            v = lab.validate(PRESETS[row["preset"]])
-        except (ValueError, BudgetExceeded) as e:
-            errors.append({"preset": row["preset"], "step": "validate", "error": str(e)})
+    left, picked = lab.weekly_validations_left(), 0
+    for row in [r for r in rows if r["eligible"]]:
+        if picked >= TOP_VALIDATE:
+            break
+        name, spec = row["preset"], PRESETS[row["preset"]]
+        on_roster = lab.store.get_strategy(row["spec_id"])
+        if on_roster is not None:
+            skipped.append({"preset": name, "reason": f"on the roster (status {on_roster['status']})"
+                            + (f": {on_roster['status_reason']}" if on_roster["status_reason"] else "")})
             continue
-        m = v["metrics"]
-        validations.append({"preset": row["preset"], "spec_id": v["spec_id"], "passed": v["passed"],
-                            "n": m["n"], "avg_r": m["avg_r"], "profit_factor": m["profit_factor"],
-                            "deflated_sharpe": v["gate"]["deflated_sharpe"],
-                            "failed": [c["name"] for c in v["gate"]["checks"] if not c["passed"]],
-                            "experiment_id": v["experiment_id"]})
+        picked += 1
+        try:
+            prior = lab.prior_validation(spec)
+        except ValueError as e:
+            errors.append({"preset": name, "step": "validate", "error": str(e)})
+            continue
+        if prior is not None:               # the locked window was already looked at: keep that verdict
+            validations.append(_validation_row(name, row["spec_id"], prior["metrics"] or {},
+                                               prior["id"], reused=True))
+            continue
+        if left is not None and left <= 0:
+            skipped.append({"preset": name, "reason": "research.max_validations_per_week reached"
+                                                      " for the last 7 days"})
+            continue
+        try:
+            v = lab.validate(spec)
+        except (ValueError, BudgetExceeded) as e:
+            errors.append({"preset": name, "step": "validate", "error": str(e)})
+            continue
+        left = None if left is None else left - 1
+        gate = v["gate"]
+        validations.append(_validation_row(name, v["spec_id"],
+                                           {**v["metrics"], "passed": v["passed"], "checks": gate["checks"],
+                                            "deflated_sharpe": gate["deflated_sharpe"]},
+                                           v["experiment_id"], reused=False))
 
     for v in validations if promote else []:
         if not v["passed"]:
@@ -96,8 +146,9 @@ def sweep(lab: Lab, presets: list[str] | None = None, promote: bool = False) -> 
         research_row = next(r for r in rows if r["preset"] == v["preset"])
         rationale = (f"Autopilot sweep: research mean R {research_row['avg_r']:+.3f} over"
                      f" {research_row['n']} trades (edge over random entries"
-                     f" {research_row['edge_r']:+.3f} R); validation mean R {v['avg_r']:+.3f} over"
-                     f" {v['n']} trades, deflated Sharpe {v['deflated_sharpe']:.2f}.")
+                     f" {research_row['edge_r']:+.3f} R); validation (experiment {v['experiment_id']})"
+                     f" mean R {_num(v['avg_r'], '{:+.3f}')} over {v['n']} trades, deflated Sharpe"
+                     f" {_num(v['deflated_sharpe'], '{:.2f}')}.")
         try:
             p = lab.promote(PRESETS[v["preset"]], v["preset"], rationale)
         except ValueError as e:
@@ -108,10 +159,11 @@ def sweep(lab: Lab, presets: list[str] | None = None, promote: bool = False) -> 
 
     now = int(time.time())
     out = rounded({"as_of": iso_time(now), "presets": names, "ranking": rows,
-                   "validations": validations, "promoted": promoted, "errors": errors})
+                   "validations": validations, "promoted": promoted, "errors": errors,
+                   "skipped": skipped})
     out["experiment_id"] = lab.store.add_experiment(
         "sweep", None, None, None, None,
-        {k: out[k] for k in ("ranking", "validations", "promoted", "errors")},
+        {k: out[k] for k in ("ranking", "validations", "promoted", "errors", "skipped")},
         source="autopilot", notes=f"presets={','.join(names)} promote={promote}", now_t=now)
     n_ok = sum(v["passed"] for v in validations)
     lab.store.add_journal(

@@ -20,13 +20,15 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: write          # used only by the restore and save steps (GH_TOKEN below)
 
 jobs:
   tick:
     if: vars.FIBBOT_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 180   # a first run downloads years of candles; a research cycle can be long
+    # The bot step has its own, shorter timeout (below): a step that times out FAILS instead of
+    # being cancelled, so the report, state and candle steps still run in the time left.
+    timeout-minutes: 180
     defaults:
       run:
         shell: bash        # explicit bash = "bash --noprofile --norc -eo pipefail"
@@ -36,6 +38,10 @@ jobs:
       STATE_BRANCH: fibbot-state
     steps:
       - uses: actions/checkout@v4
+        with:
+          # No token in .git/config while the bot (and its pip-installed dependencies) runs;
+          # the restore and save steps pass it to git through their own environment only.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -43,11 +49,16 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
+      # requirements.txt pins exact versions, so an hourly install never picks up a new release.
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Restore state from the fibbot-state branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$GITHUB_SERVER_URL/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           mkdir -p "$FIBBOT_HOME"
           rc=0
           git ls-remote --exit-code --heads origin "$STATE_BRANCH" > /dev/null || rc=$?
@@ -74,11 +85,14 @@ jobs:
           restore-keys: fibbot-candles-
 
       # "run --once" exits 1 when any step of the pass failed (each step is isolated and the
-      # database stays consistent), so the steps below still run after a failure: state that
-      # cost API tokens (signal reviews, research cycles) is never thrown away. The job is
-      # still marked failed so you notice.
+      # database stays consistent: every write is a committed SQLite transaction), so the steps
+      # below still run after a failure, a timeout or a cancel: state that cost API tokens
+      # (signal reviews, research cycles, the attempt marker that stops a crashed cycle from
+      # being paid for again on the next run) is never thrown away. The job is still marked
+      # failed so you notice. 150 minutes leaves the job's 180 enough time for the saves.
       - name: Run one bot cycle
         id: bot
+        timeout-minutes: 150
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -90,34 +104,66 @@ jobs:
             python -m fibbot run --once --no-brain
           fi
 
+      # The steps below run whenever the bot step ran at all (succeeded, failed, timed out or was
+      # cancelled), and never when it was skipped (e.g. the state could not be restored).
       - name: Show the report in the run summary
-        if: ${{ !cancelled() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure') }}
+        if: ${{ always() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure' || steps.bot.outcome == 'cancelled') }}
         run: |
           if [ -f "$FIBBOT_HOME/REPORT.md" ]; then
             head -c 900000 "$FIBBOT_HOME/REPORT.md" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Save state to the fibbot-state branch (one squashed commit)
-        if: ${{ !cancelled() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure') }}
+        if: ${{ always() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure' || steps.bot.outcome == 'cancelled') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Fold each SQLite write-ahead log into its database so the commit is self-contained.
+          # Compact each SQLite database and fold its write-ahead log into it so the commit is
+          # self-contained, then check the sizes: GitHub rejects files over 100 MB, and a
+          # rejected push would lose this run's state (and every later run's) without a clear
+          # message.
           python - <<'EOF'
           import glob, os, sqlite3, sys
-          for db in glob.glob(os.path.join(os.environ["FIBBOT_HOME"], "*.sqlite")):
+          home = os.environ["FIBBOT_HOME"]
+          WARN_MB, MAX_MB = 50, 95
+          for db in sorted(glob.glob(os.path.join(home, "*.sqlite"))):
               con = sqlite3.connect(db)
+              try:
+                  con.execute("VACUUM")
+              except sqlite3.Error as e:
+                  print(f"::warning::VACUUM of {db} failed ({e}); saving it as it is")
               busy = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
               con.close()
               if busy:
                   sys.exit(f"checkpoint of {db} was blocked")
+          too_big = False
+          for root, dirs, files in os.walk(home):
+              dirs[:] = [d for d in dirs if not (root == home and d == "candles")]
+              for name in files:
+                  if name.endswith((".log", ".sqlite-wal", ".sqlite-shm")) or ".log." in name:
+                      continue
+                  path = os.path.join(root, name)
+                  mb = os.path.getsize(path) / 1e6
+                  if mb > MAX_MB:
+                      too_big = True
+                      print(f"::error::{path} is {mb:.0f} MB; GitHub rejects files over 100 MB, so"
+                            f" the state was NOT saved. Prune old experiments/journal entries or move"
+                            f" the bot to Docker.")
+                  elif mb > WARN_MB:
+                      print(f"::warning::{path} is {mb:.0f} MB; the state cannot be saved once a"
+                            f" file passes 100 MB (GitHub's limit).")
+          sys.exit(1 if too_big else 0)
           EOF
 
           # Stage .fibbot/ into a throw-away index (the checkout and its index stay untouched),
           # then write a parentless commit and force-push it as the whole branch.
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$GITHUB_SERVER_URL/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           export GIT_DIR="$GITHUB_WORKSPACE/.git" GIT_WORK_TREE="$FIBBOT_HOME"
           export GIT_INDEX_FILE="$RUNNER_TEMP/fibbot-state.index"
           rm -f "$GIT_INDEX_FILE"
           cd "$FIBBOT_HOME"
-          git add --all --force -- . ':(exclude)candles' ':(exclude)*.log' \
+          git add --all --force -- . ':(exclude)candles' ':(exclude)*.log' ':(exclude)*.log.*' \
             ':(exclude)*.sqlite-wal' ':(exclude)*.sqlite-shm'
           if [ -z "$(git ls-files)" ]; then
             echo "::warning::State directory is empty; not overwriting the $STATE_BRANCH branch."
@@ -131,7 +177,7 @@ jobs:
           git push --force origin "$commit:refs/heads/$STATE_BRANCH"
 
       - name: Save the candle cache
-        if: ${{ !cancelled() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure') }}
+        if: ${{ always() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure' || steps.bot.outcome == 'cancelled') }}
         uses: actions/cache/save@v4
         with:
           path: .fibbot/candles

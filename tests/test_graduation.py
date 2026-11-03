@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fibbot.config import DEFAULTS, deep_merge
-from fibbot.graduation import evaluate, monthly_r, validation_mean_r
-from fibbot.metrics import bootstrap_mean_ci, deflated_sharpe
+from fibbot.graduation import CS_TARGET_TRADES, evaluate, monthly_r, validation_mean_r
+from fibbot.metrics import confidence_sequence, deflated_sharpe, effective_n, entry_week
 from fibbot.store import Store
 from fibbot.types import Trade
 
@@ -60,6 +60,11 @@ class GraduationTestCase(unittest.TestCase):
     def checks(self, res):
         return {c["name"]: c for c in res["checks"]}
 
+    def closed(self):
+        """Closed paper trades in evaluate's (chronological) order."""
+        return sorted((self.store.trade_from_row(r) for r in self.store.paper_trades(SID)
+                       if r["exit_t"] is not None), key=lambda tr: (tr.entry_t, tr.symbol, tr.leg_id))
+
     def failed(self, res):
         return {c["name"] for c in res["checks"] if not c["passed"]}
 
@@ -78,8 +83,13 @@ class TestStatuses(GraduationTestCase):
         self.assertEqual((c["min_trades"]["value"], c["min_trades"]["threshold"]), (60, 40))
         self.assertAlmostEqual(c["min_profit_factor"]["value"], 3.25, places=4)
         self.assertEqual(c["min_positive_month_frac"]["value"], 1.0)
-        self.assertAlmostEqual(c["max_shortfall_vs_validation_r"]["value"], 0.75, places=6)
-        self.assertAlmostEqual(c["max_shortfall_vs_validation_r"]["threshold"], 0.35, places=6)
+        # the shortfall of paper mean R (0.75) behind validation mean R (0.6), at most 0.25
+        self.assertAlmostEqual(c["max_shortfall_vs_validation_r"]["value"], -0.15, places=6)
+        self.assertAlmostEqual(c["max_shortfall_vs_validation_r"]["threshold"], 0.25, places=6)
+        self.assertIn("paper mean R +0.750 vs validation mean R +0.600",
+                      c["max_shortfall_vs_validation_r"]["note"])
+        self.assertIn("anytime-valid", c["mean_r_ci_lower"]["note"])
+        self.assertEqual(set(res["evidence"]), {"n_eff", "design_effect", "weeks", "t_clustered"})
         lo, hi = res["mean_r_ci"]
         self.assertGreater(lo, 0)
         self.assertLess(lo, 0.75)
@@ -147,11 +157,21 @@ class TestSingleCheckFailures(GraduationTestCase):
         self.assertEqual(res["status"], "promising")
 
     def test_profit_factor(self):
-        # same R multiples, but the losers risked 3% of the notional and the winners 1%: PF 1.08
+        self.add()
+        self.put(WINNING * 10, days=85)                      # R profit factor 3.25
+        self.cfg["graduation"]["min_profit_factor"] = 4.0
+        self.assertOnlyFails("min_profit_factor")
+
+    def test_profit_factor_is_on_r_not_on_stop_width(self):
+        # Same R multiples, but the losers had 3% stops and the winners 1% stops. Sizing by risk
+        # makes every trade's P&L proportional to R, so the profit factor stays 3.25 (it used to
+        # be computed on ret_pct, 1.08, which failed this record for its stop widths).
         self.add()
         rs = WINNING * 10
         self.put(rs, days=85, risks=[0.01 if r > 0 else 0.03 for r in rs])
-        self.assertOnlyFails("min_profit_factor")
+        res = self.evaluate(90)
+        self.assertAlmostEqual(self.checks(res)["min_profit_factor"]["value"], 3.25, places=4)
+        self.assertEqual(res["status"], "graduated", res["summary"])
 
     def test_positive_months(self):
         self.add()
@@ -179,7 +199,8 @@ class TestChecks(GraduationTestCase):
         res = self.evaluate(90)
         c = self.checks(res)["max_shortfall_vs_validation_r"]
         self.assertFalse(c["passed"])
-        self.assertAlmostEqual(c["threshold"], 1.25, places=6)
+        self.assertAlmostEqual(c["value"], 0.75, places=6)        # 1.5 - 0.75
+        self.assertAlmostEqual(c["threshold"], 0.25, places=6)
         self.assertEqual(res["status"], "promising")
 
     def test_missing_validation_mean_passes_with_a_note(self):
@@ -232,20 +253,27 @@ class TestChecks(GraduationTestCase):
         self.add()
         self.put(WINNING * 10, days=85)
         rs = WINNING * 10
+        weeks = [entry_week(t.entry_t) for t in self.closed()]
+        n_eff = effective_n(rs, weeks)
         alone = self.checks(self.evaluate(90))["min_deflated_sharpe"]["value"]
-        self.assertAlmostEqual(alone, deflated_sharpe(rs, n_trials=1), places=5)
+        self.assertAlmostEqual(alone, deflated_sharpe(rs, n_trials=1, n_eff=n_eff), places=5)
         for k in range(30):
             self.add(sid=f"other{k}")
         crowded = self.checks(self.evaluate(90))["min_deflated_sharpe"]["value"]
-        self.assertAlmostEqual(crowded, deflated_sharpe(rs, n_trials=31), places=5)
+        self.assertAlmostEqual(crowded, deflated_sharpe(rs, n_trials=31, n_eff=n_eff), places=5)
         self.assertLess(crowded, alone)
 
     def test_ci_level_comes_from_config(self):
         self.add()
         self.put(WINNING * 10, days=85)
+        wide = self.evaluate(90)["mean_r_ci"]
         self.cfg["graduation"]["ci_level"] = 0.5
         res = self.evaluate(90)
-        lo, hi = bootstrap_mean_ci(WINNING * 10, level=0.5)
+        closed = self.closed()
+        lo, hi = confidence_sequence([t.r_multiple for t in closed], level=0.5,
+                                     groups=[entry_week(t.entry_t) for t in closed],
+                                     target_n=CS_TARGET_TRADES)
+        self.assertLess(wide[0], lo)
         self.assertAlmostEqual(res["mean_r_ci"][0], lo, places=5)
         self.assertAlmostEqual(res["mean_r_ci"][1], hi, places=5)
 

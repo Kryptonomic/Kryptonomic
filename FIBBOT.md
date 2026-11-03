@@ -15,9 +15,10 @@ notebook. Plain code, not Claude, enforces every risk limit, budget and gate.
 - A research lab for one family of strategies: buying pullbacks to Fibonacci levels (and selling
   rallies, if you allow shorts).
 - A paper trader. Every account is simulated, starting at $10,000 per strategy.
-- Honest by design. A locked validation period, a random-entry baseline, a correction for the
-  number of ideas tried, and a forward paper period all stand between an idea and the label
-  "reliably profitable".
+- Honest by design. A locked validation period, a random-entry baseline (on the research data,
+  on the validation period and again on paper), a correction for the number of looks at the
+  locked data, and a forward paper period all stand between an idea and the label "reliably
+  profitable".
 
 **It is not:**
 
@@ -47,12 +48,13 @@ notebook. Plain code, not Claude, enforces every risk limit, budget and gate.
    +------------------------------+   RESEARCH WINDOW: all history except the last 12 months
    | backtest + walk-forward      |
    | + random-entry baseline      |
-   | + robustness (small nudges)  |
+   | + robustness (one-step moves)|
    +------------------------------+
             |  only the best ideas
             v
    +------------------------------+   VALIDATION WINDOW: the last 12 months, kept locked
-   | validation gate (pass/fail)  |
+   | validation gate (pass/fail)  |   (pinned once a strategy is on paper)
+   | must beat random entries too |
    +------------------------------+
             |  passed
             v
@@ -82,18 +84,34 @@ The steps in plain words:
 3. **Backtest.** The engine replays history bar by bar. It never looks ahead: a decision at the
    close of a bar uses only that bar and earlier ones, and orders fill on later bars.
 4. **Walk-forward.** The research data is cut into 4 time slices. Settings are chosen using the
-   early slices only, then scored on the next slice they have not seen. This shows whether
-   "tuned on the past" still works "on the future".
-5. **Random baseline.** The same trades, with the same stop distance and targets, but entered at
-   random times. If the Fibonacci entries do not beat random entries, there is no real edge.
-6. **Robustness.** Each setting is nudged one step up and one step down. A real edge survives small
-   changes; a lucky setting does not.
+   early slices only, then scored on the next slice the optimizer has not seen. This shows whether
+   "tuned on the past" still works "on the future". The slices are unseen by the optimizer but not
+   by the researcher (Claude sees every slice's backtest results first), so walk-forward measures
+   how stable the tuning is, not independent evidence. Only the locked validation period and paper
+   trades are unseen.
+5. **Random baseline.** The same trades, with the same stop distance, entry cost and targets, but
+   entered at random times on the same coins and window. A second set of random entries is drawn
+   only at times the strategy's trend / ADX filter allowed. This tests entry selection (the setup
+   plus its filter) against random timing; judge on the smaller of the two edges. If the Fibonacci
+   entries do not beat random entries, there is no real edge, and the bot will not promote it.
+6. **Robustness.** Every setting is moved one step up and one step down (up to 48 neighbours).
+   Neighbours that trade exactly like the original are flagged as duplicates and left out of the
+   score. A real edge survives small changes; a lucky setting does not.
 7. **Validation gate.** A fixed pass/fail test on the locked last 12 months. That data is never
-   used for tuning. The bar rises with the number of ideas tried so far (the "deflated Sharpe").
+   used for tuning. The coins are chosen as they stood before the period started (by trading
+   volume), not by today's ranking. The strategy must also beat random entries on that period by a
+   significant margin. The bar rises with every look at the locked period (the "deflated
+   Sharpe"), and each strategy gets one look per period. Once a strategy is on paper the period is
+   pinned: it no longer slides forward over the data paper trades on.
 8. **Paper trading.** A strategy that passes starts paper trading on the next new candle. Every
-   hour the bot re-runs the same engine over the new candles. Past paper trades never change.
+   hour the bot re-runs the same engine over the new candles, so paper equals a backtest of the
+   same period. History is never rewritten: a closed trade's prices and R are final, a trade that
+   a code or data change would back-date is refused, and an open trade that the replay stops
+   reproducing for 3 updates in a row, or whose coin's candles fall more than 3 days behind, is
+   closed at the latest close, with costs (exit reason `void` or `data_gap`).
 9. **Graduation gate.** Every hour each paper strategy is checked against a second fixed test that
-   uses its paper results only. Passing it takes at least 60 days and 40 closed paper trades.
+   uses its paper results only. Passing it takes at least 60 days with candles and 40 closed
+   paper trades, and in practice much longer.
 
 The gates are ordinary code with fixed thresholds (see [Graduation criteria](#graduation-criteria)).
 Claude can propose, test and promote ideas, but it cannot pass a gate by arguing.
@@ -139,7 +157,12 @@ swing.
 - **Target 2:** an extension beyond the old high, usually 1.618. Some presets trail the rest
   with an ATR stop instead.
 - **Time stop:** a trade still open after a set number of bars (default 120) is closed.
-- A setup is only taken if the planned reward is at least 1.5 times the risk.
+- A setup is only taken if the planned reward is at least 1.5 times the risk. That ratio is
+  before costs. `min_stop_cost_mult` (0-20, off by default) is the lever against stops so tight
+  that costs eat them, which mostly matters on 1h: 3 means the stop must be at least three
+  round-trip costs away (about 0.75% of the price with the default costs in limit mode). On 6
+  coins it cut the losses of `golden_pocket_1h` from -0.097 R to -0.048 R per trade; it stayed
+  negative.
 
 **A worked example.** BTC rises from an anchor at 60,000 to an extreme at 70,000. The leg is
 10,000. ATR is 800.
@@ -159,14 +182,25 @@ position at each target, the planned reward is about 3.5 times the risk, so the 
 
 **Results are counted in R.** R is profit divided by the amount risked. +1R means you made what you
 risked; -1R is a full stop-out. With the default 0.5% risk per trade, 1R is 0.5% of the account.
+The profit factor is gross winning R divided by gross losing R, so it is above 1 exactly when the
+total R is positive. R statistics count every trade equally, while the account under-sizes trades
+whose stop is very tight (a position may not exceed 25% of the account, so any stop closer than 2%
+risks less than 0.5%). In the measured data this makes the R-based gates more conservative.
 
 **How the simulator fills orders.** It is cautious on purpose:
 
 - A candle only shows open, high, low and close, not their order. When one candle touches both
   the stop and a target, the stop is assumed to have come first.
 - A candle that makes a new high is never treated as the dip that sets up a confirm entry.
-- A target is never paid on the candle the trade opened on.
+- A resting limit entry fills only if price trades 0.02% through it (`costs.limit_through`). A
+  bare touch does not fill: the setups that just tag a level and bounce are the best trades, and
+  a queued order often misses them. Targets still fill on a touch.
+- On the candle a trade opened on, only the stop is checked during the candle (its high may have
+  come before the fill). If that candle closes beyond a target, the target is paid at its price.
+- A fill at or beyond the stop (the candle opened through it) is stopped out at once, and its R is
+  measured against the planned risk of the order.
 - Each side of a trade pays 0.1% in fees. Market and stop orders also lose 0.05% to slippage.
+- No leverage: all open positions together may not exceed the account's equity.
 
 **Built-in presets** (`python -m fibbot presets`):
 
@@ -181,20 +215,24 @@ risked; -1R is a full stop-out. With the default 0.5% risk per trade, 1R is 0.5%
 | `golden_pocket_1d` | 1d, long | Zone 0.5-0.65, limit at the middle, stop 0.886 |
 | `ext_runner_4h` | 4h, long | Golden pocket, 30% at 1.0, trail the rest 2.5 ATR, target 2.618 |
 
-Claude and the optimizer explore around these by changing the 27 settings (zone, entry style,
-stop, targets, trend filter, swing size and so on).
+Claude and the optimizer explore around these by changing the 28 settings (zone, entry style,
+stop, targets, trend filter, swing size, minimum stop distance and so on).
 
 ## Quick start
 
 You need Python 3.10 or newer.
 
 ```bash
-pip install -r requirements.txt          # installs the Claude SDK (only the brain needs it)
+pip install -r requirements.txt          # the Claude SDK, pinned to exact versions (only the brain needs it)
 export ANTHROPIC_API_KEY=sk-ant-...      # optional: without it the bot runs without the brain
 python -m fibbot data                    # first download of candles: about 5-15 minutes
 python -m fibbot sweep                   # test the 8 presets (no Claude needed), report only
 python -m fibbot run                     # run around the clock (stop with Ctrl+C)
 ```
+
+`requirements.txt` pins the exact versions of the Claude SDK and everything it depends on, so an
+unattended install never picks up a new release. Upgrading is deliberate: bump the pins, run
+`pip install -r requirements.txt`, then run the tests (`python -m pytest tests`).
 
 What `run` does every hour, just after the candle closes:
 
@@ -203,15 +241,28 @@ What `run` does every hour, just after the candle closes:
 3. Ask Claude about each new signal (by default this is only recorded, see
    [Configuration](#configuration)).
 4. Check every paper strategy against the graduation gate. A strategy is retired automatically if
-   its paper drawdown goes past 22.5% (1.5 x the 15% limit).
+   its paper drawdown goes past 22.5% (1.5 x the 15% limit). Without Claude, a strategy whose
+   status is "failing" is retired too, so a loser cannot block the automatic research.
 5. Run Claude's daily review and weekly research cycle when they are due. While no strategy is
-   on paper there is nothing to review, so research runs daily instead. Without Claude, an empty
-   roster triggers the automatic preset sweep instead, at most once a week.
-6. Rewrite the report at `.fibbot/REPORT.md`.
+   on paper there is nothing to review, so research runs daily instead, except while the weekly
+   validation cap is used up (it could not validate anything). Without Claude, an empty roster
+   triggers the automatic preset sweep instead, at most once a week.
+6. Rewrite the report at `.fibbot/REPORT.md` and, about once a day, compact the database (old
+   experiment details and old system-log entries; nothing a gate reads).
 
 If a step fails, the error goes into the journal and the log, and the remaining steps still run.
-A Claude cycle that fails or crashes is not retried on every pass: the next try comes 6 hours
-after the failed one started, so a flaky API cannot run up the bill.
+The same failure of the same step is written to the journal at most once a day (the log still
+gets it every time). A Claude cycle that fails or crashes is not retried on every pass: the next
+try comes 6 hours after the failed one started, so a flaky API cannot run up the bill. A cycle
+also stops after `brain.max_cycle_minutes` (60): it gets one last reply to write its notebook
+entry and summary.
+
+**When candles stop arriving.** One coin failing to download is only a warning. When every
+download fails, an open paper position's candles are more than 3 bars old, or no coin has a
+recent bar on a timeframe, the data step fails on every pass (so `run --once` exits 1 and an
+Actions run is marked failed), the stall is journaled once when it starts and once when it ends,
+and the report shows a **STALE DATA** banner. The review cycle waits for fresh candles; research
+continues on the cached history. Days without candles do not count toward the 60 graduation days.
 
 Read the results with `python -m fibbot status`, or open `.fibbot/REPORT.md`.
 
@@ -229,12 +280,13 @@ Run `python -m fibbot <command> --help` for the exact options of each command.
 | `backtest --preset NAME` | Backtest one strategy. Options: `--window research` (default), `validation` or `all`; `--symbols ...`; `--tf 1h` to try another timeframe; `--trades N` to list the last N trades. |
 | `optimize --preset NAME --grid JSON` | Walk-forward search over a grid, for example `--grid '{"entry_zone_hi": [0.65, 0.705, 0.786]}'`. The grid can also be a JSON file. |
 | `baseline --preset NAME [--runs N]` | Compare the strategy with random entries (10 runs by default). |
-| `robustness --preset NAME` | Nudge each setting one step and re-test. |
-| `validate --preset NAME` | Run the validation gate on the locked last 12 months. |
-| `promote --preset NAME --rationale TEXT [--name LABEL]` | Put a validated strategy on paper (at most 4 at a time). |
-| `retire ID --reason TEXT` | Take a strategy off paper. Its trades stay on record. |
+| `robustness --preset NAME` | Move every setting one step both ways and re-test (duplicates of the original are flagged). |
+| `validate --preset NAME` | Run the validation gate on the locked last 12 months. One look per strategy per validation period. |
+| `promote --preset NAME --rationale TEXT [--name LABEL]` | Put a validated strategy on paper (at most 4 at a time). It needs a passed validation and a `baseline` run showing an edge over random entries. |
+| `retire ID --reason TEXT` | Take a strategy off paper. Its trades stay on record, and retirement is final: a retired strategy can never be promoted again (promote a variant with a changed setting instead). |
+| `epoch [--roll]` | Show the pinned validation period. `--roll` moves it forward by `research.validation_months` (journaled; the new period overlaps data your paper strategies traded on). |
 | `sweep [--promote] [--presets NAME ...]` | Test the presets (by default every preset whose timeframe is in `data.timeframes`) with a baseline. A preset is eligible with enough trades, a positive mean R, at least half of the folds positive and an edge over random entries. The top 3 eligible ones are validated, and with `--promote` the passing ones go on paper. |
-| `tick` | Update candles and the paper accounts once, now. |
+| `tick` | Update candles and the paper accounts once, now (exit code 1 if anything failed, including a download). |
 | `brain research`, `brain review`, `brain signals` | Run one Claude research cycle, review cycle or signal review now. |
 | `run [--once] [--no-brain]` | The full loop. Ctrl+C stops it after the current step. `--once` does one pass and exits (exit code 1 if a step failed). `--no-brain` never calls Claude. |
 | `status` | A summary in the terminal. |
@@ -250,8 +302,12 @@ python -m fibbot backtest --spec '{"preset": "golden_pocket_4h", "entry_zone_hi"
 `backtest`, `optimize`, `baseline`, `robustness`, `validate`, `sweep` and `status` also take
 `--json` to print machine-readable output.
 
-Do not use `--window validation` while you are still exploring ideas. Each look at the locked
-period makes its verdict less trustworthy. Use `validate` once you have a finished candidate.
+Do not use `--window validation` or `--window all` while you are still exploring ideas. Each
+look at the locked period makes its verdict less trustworthy. Such a run prints a warning, counts
+as a trial and as a look at that strategy's held-out period (raising the bar for every later
+validation), is stored with source `cli-holdout` with its numbers hidden from Claude, and is
+counted as "CLI holdout peeks" in `status` and REPORT.md. Use `validate` once you have a finished
+candidate.
 
 ## Graduation criteria
 
@@ -260,11 +316,29 @@ period makes its verdict less trustworthy. Use `validate` once you have a finish
 | Check | Default |
 |---|---|
 | Closed trades | at least 30 |
-| Profit factor (gross wins / gross losses) | at least 1.2 |
+| Profit factor (gross winning R / gross losing R) | at least 1.2 |
 | Average trade (expectancy) | at least +0.05 R |
-| Deflated Sharpe (corrected for all ideas tried) | at least 0.90 |
-| Maximum drawdown of the simulated account | at most 20% |
+| Deflated Sharpe (corrected for every look at the locked period, trades clustered by week) | at least 0.90 |
+| Maximum drawdown of the simulated account (marked to market) | at most 20% |
 | Share of traded coins that made money | at least 50% |
+| Average trade minus that of random entries on the same period (50 runs) | at least 0 R |
+| z score of that edge | at least 1.65 |
+
+How the validation stays honest:
+
+- The coins are the top coins by trading volume in the 90 days before the period started, not
+  today's list, which holds coins because they rallied during that year. The pool is today's
+  list, every coin the bot has seen in a list, the static fallback list and any cached candles
+  (coins you download with `data --symbols` join it).
+- Each strategy gets one look per validation period. Validating the same strategy again is
+  refused while the period overlaps the earlier one (the earlier verdict stands, and the
+  automatic sweep reuses it). A changed setting is a new strategy and a new look.
+- For promotion, every validation of the strategy in the last `validation_months` must have
+  passed, and its research-period baseline must beat random entries.
+- Claude's cycles and the automatic sweep share `research.max_validations_per_week` (3). Your own
+  `validate` commands are not capped, but count.
+- Once the first strategy is on paper, the validation period is pinned: later data is forward
+  data only and never becomes validation data by sliding. `epoch --roll` moves it on purpose.
 
 **Second gate: graduation** (on paper trades only). Every check must pass:
 
@@ -273,22 +347,36 @@ period makes its verdict less trustworthy. Use `validate` once you have a finish
 | Days on paper | at least 60 |
 | Closed paper trades | at least 40 |
 | Profit factor | at least 1.3 |
-| 95% confidence interval of the average trade (bootstrap) | lower end above 0 R |
+| 95% anytime-valid confidence interval of the average trade, trades clustered by week | lower end above 0 R |
 | Maximum drawdown of the paper account | at most 15% |
 | Share of calendar months that made money (months with trades) | at least 60% |
 | Deflated Sharpe (corrected for every strategy ever put on paper) | at least 0.95 |
+| Average paper trade minus that of random entries over the paper period | at least 0 R |
+| z score of that edge | at least 1.65 |
 | Paper average trade vs. validation average trade | at most 0.25 R worse |
 
-A paper strategy always shows one of four statuses:
+"Days on paper" counts only days the strategy had candles for. The interval is "anytime-valid":
+the gate is re-checked every hour, and an ordinary 95% interval re-tested that often would let
+about 1 in 10 strategies with no edge graduate within a year by luck. With this interval it is
+about 2.5% or less, at the cost of time.
+
+A paper strategy always shows one of five statuses:
 
 - **collecting**: not enough days or trades yet.
-- **promising**: enough data, but not every check passes yet.
-- **failing**: clearly losing (with at least 20 trades: profit factor below 1 and even the
-  optimistic end of the confidence interval is negative), or drawdown above 22.5%.
+- **promising**: enough data and a positive average trade, but not every check passes yet. Give
+  it time.
+- **lagging**: enough data, but the paper average trade is zero or negative. It becomes failing
+  if that is still so after three times the minimum days (180).
+- **failing**: a drawdown above 22.5%; or clearly losing (with at least 20 trades: profit factor
+  below 1 and even the optimistic end of the interval is negative); or, once mature, even the
+  optimistic end of the interval is below the validation average minus 0.25 R; or still not
+  profitable after 180 days.
 - **graduated**: every check passed. This is a statement about paper results. Nothing switches
   to live trading. What you do with it is your decision.
 
-Expect this to take months. Most ideas fail along the way, which is the point.
+Expect this to take a year or more. A strategy whose true edge is +0.3 R per trade, with about two
+trades every three days, graduates within a year about 55-65% of the time; +0.25 R about 40%; +0.2 R
+about half the time within two years. Most ideas fail along the way, which is the point.
 
 ## Cost of the Claude API
 
@@ -302,9 +390,17 @@ Rough estimates with the default settings:
 
 | Claude call | How often | Rough cost each | Rough cost per month |
 |---|---|---|---|
-| Research cycle (up to 60 tool steps, effort "high") | weekly; daily while no strategy is on paper | $2 - $10 | $10 - $40 |
-| Review cycle (smaller budget, no optimizer) | daily | $0.50 - $3 | $15 - $90 |
-| Signal review (one short question per new setup) | per signal, at most 40 a day | $0.02 - $0.07 | $1 - $20 typical |
+| Research cycle (up to 60 model turns, effort "high") | weekly; daily while no strategy is on paper | $2 - $10 | $10 - $40 |
+| Review cycle (at most 20 turns, effort "medium", no optimizer) | daily | $0.50 - $3 | $15 - $90 |
+| Signal review (one short question per new setup) | per signal, at most 40 calls a day | $0.02 - $0.07 | $1 - $20 typical |
+
+The worst case of one cycle is its turn cap times `brain.max_tokens` (64,000 output tokens per
+reply, thinking included) times the output price, plus the cache reads: about 60 x 64,000 x $20 /
+million = $77 for a research cycle that used every turn to the limit, and 20 x 64,000 x $20 /
+million = $26 for a review cycle. Real cycles stop far below that; the review cycle's cost is
+bounded by its turn cap and effort. Each cycle's token usage is in its journal entry (with the
+turn cap, effort, resumes after API errors and whether it wrapped up), and the kv entry
+`brain_usage` tallies tokens per month.
 
 While no strategy is on paper, research runs daily and there are no reviews or signals, so
 expect roughly $2 to $10 a day until the first strategy is promoted.
@@ -320,7 +416,11 @@ Ways to spend less (see [Configuration](#configuration)):
 - `"brain": {"review_every_hours": 72}`: review every 3 days instead of daily. This also slows
   research to every 3 days while no strategy is on paper.
 - `"brain": {"signal_review": "off"}`: no per-signal calls at all.
-- `"brain": {"max_iterations": 30}`: shorter research cycles.
+- `"brain": {"max_iterations": 30}`: shorter research cycles; `"review_max_iterations": 10` for
+  reviews.
+- `"brain": {"max_monthly_output_tokens": 5000000}`: a hard monthly cap on output tokens. Once it
+  is reached, cycles and signal reviews stop until the next UTC month and the automatic preset
+  sweep stands in.
 - `"brain": {"model": "claude-sonnet-5-5"}`: about half the price per token ($2 / $10 per
   million), with some loss of research quality.
 - Run with no API key, or with `run --no-brain`. That costs nothing, and research is limited to
@@ -349,7 +449,7 @@ The computer must stay on and awake. A laptop that sleeps pauses the bot.
 
 ```bash
 docker build -t fibbot .
-docker run -d --name fibbot --init --restart unless-stopped \
+docker run -d --name fibbot --init --stop-timeout 300 --restart unless-stopped \
   -e ANTHROPIC_API_KEY \
   -v fibbot-data:/data \
   fibbot
@@ -358,8 +458,12 @@ docker run -d --name fibbot --init --restart unless-stopped \
 - All state lives in the `fibbot-data` volume, mounted at `/data`. It survives restarts and
   rebuilds.
 - `-e ANTHROPIC_API_KEY` passes the key from your shell. Leave it out to run without the brain.
-- `--init` lets `docker stop` shut the bot down cleanly.
-- Your own config: add `-v "$PWD/fibbot.json:/app/fibbot.json:ro"`.
+- `--init` forwards `docker stop`'s signal to the bot, which finishes its current step (a Claude
+  cycle wraps up at its next turn) before exiting. Docker's default grace period is 10 seconds,
+  after which it kills the bot mid-step and a paid cycle in progress is lost; `--stop-timeout 300`
+  (compose: `stop_grace_period: 5m`) gives it time. A kill never corrupts the state.
+- Your own config: add `-v "$PWD/fibbot.json:/app/fibbot.json:ro"`. Do not set `home` in it: the
+  image uses `FIBBOT_HOME=/data`, which takes precedence over a config file's `home` anyway.
 - Follow the log: `docker logs -f fibbot`.
 - Run other commands inside it: `docker exec fibbot python -m fibbot status`.
 - Read the report: `docker exec fibbot cat /data/REPORT.md`.
@@ -409,20 +513,33 @@ Things to know:
   `"7 */4 * * *"` for every 4 hours. Missed hours are caught up, as explained above.
 - The first run downloads years of candles and may start a research cycle, so it can take up to
   an hour or more. Later runs usually take a few minutes. Runs never overlap.
-- If one step of a run fails (for example, the exchange is briefly unreachable), the run is
-  marked failed and GitHub may email you. The state and candles are still saved, and the next
+- If one step of a run fails (for example, every candle download failed), the run is marked
+  failed and GitHub may email you. The state and candles are still saved, also after a timeout
+  (the bot step stops after 150 minutes, inside the job's 180) or a manual cancel, and the next
   run carries on. The error is in the run log and in the journal.
+- The checkout does not keep the GitHub token while the bot runs; only the restore and save steps
+  get it.
+- The save step compacts the database, warns above 50 MB and refuses to push (a failed step with
+  an error message) when a state file is over 95 MB, because GitHub rejects files over 100 MB. The
+  bot compacts old experiment details daily, so this should not happen for a long time.
 - GitHub can delay scheduled runs at busy times. In public repositories it pauses schedules
   after 60 days without activity. Re-enable the workflow on the Actions tab if that happens.
 - The save step force-pushes to `fibbot-state`. A rule that blocks force-pushes on all branches
   will make it fail.
 - If candle downloads fail with HTTP 451 or 403 errors, the exchange is blocking the region of
-  GitHub's servers. Use Docker on a machine elsewhere instead.
+  GitHub's servers. These (and 418 IP bans) are not retried, so each coin costs one quick refused
+  request. Recent candles may still arrive from OKX, so a blocked runner can look healthy apart
+  from "Binance klines failed ... trying OKX" warnings in the log. Use Docker on a machine
+  elsewhere instead.
+- If the CoinGecko ranking fails (for example rate-limited on shared runner IPs), the bot keeps
+  the last ranking (or the static list) and tries again 6 hours later;
+  `python -m fibbot universe --refresh` retries at once.
 
 ## State files
 
-Everything the bot knows lives in one folder, `.fibbot/` (change it with `--home` or the
-`FIBBOT_HOME` environment variable):
+Everything the bot knows lives in one folder, `.fibbot/`. Which folder: `--home DIR` wins, then
+the `FIBBOT_HOME` environment variable, then `"home"` in the config file, then `./.fibbot` (a
+warning is logged when the file and the environment disagree):
 
 | File | What it holds |
 |---|---|
@@ -432,7 +549,7 @@ Everything the bot knows lives in one folder, `.fibbot/` (change it with `--home
 | `exchange_symbols.json` | Cached list of Binance spot pairs. |
 | `BRAIN_NOTEBOOK.md` | Claude's research notebook. It reads this at the start of every cycle. |
 | `REPORT.md` | The readable report, rewritten every run. |
-| `fibbot.log` | The run log (the same lines `run` prints on screen). |
+| `fibbot.log` | The run log (the same lines `run` prints on screen), rotated at 5 MB with 3 old files kept (`fibbot.log.1` .. `.3`). |
 
 Back up the folder by copying it while the bot is stopped. To start completely fresh, stop the
 bot and delete the folder.
@@ -447,10 +564,23 @@ file. List only the settings you want to change; everything else keeps its defau
 ```json
 {
   "universe": {"top_n": 10},
-  "portfolio": {"risk_per_trade": 0.0025},
-  "brain": {"signal_review": "shadow", "effort": "medium"}
+  "costs": {"fee_rate": 0.001, "slippage": 0.0005, "limit_through": 0.0002},
+  "portfolio": {"risk_per_trade": 0.0025, "max_total_notional": 1.0},
+  "research": {"max_validations_per_week": 3, "validation_universe": "point_in_time",
+               "validation_gate": {"min_validation_edge_r": 0.0, "min_validation_edge_z": 1.65}},
+  "brain": {"signal_review": "shadow", "effort": "medium", "max_cycle_minutes": 60}
 }
 ```
+
+The config is checked when it is loaded. An unknown key (a typo such as `"efort"`, with a "did you
+mean" hint), a wrong type, or an out-of-range or unknown value stops the command with an error
+that names the key (exit code 1). Values are case-sensitive and never normalised:
+`signal_review` must be exactly `off`, `shadow` or `active`, and efforts `low`, `medium`, `high`,
+`xhigh` or `max`.
+
+A paper account's costs, portfolio rules and starting equity are frozen when the strategy is
+promoted. Editing `costs.*`, `portfolio.*` or `paper.starting_equity` later only affects
+strategies promoted afterwards, so a config change cannot re-price a running paper record.
 
 The settings you are most likely to change (all defaults are in `fibbot/config.py`):
 
@@ -460,20 +590,33 @@ The settings you are most likely to change (all defaults are in `fibbot/config.p
 | `universe.extra_exclude` | `[]` | Coins to leave out, for example `["TRX"]`. |
 | `data.history_start` | `"2020-01-01"` | Earliest candle to download. |
 | `costs.fee_rate` / `costs.slippage` | 0.001 / 0.0005 | Fee per side, and slippage on market and stop orders. |
+| `costs.limit_through` | 0.0002 | A limit entry fills only when price trades this fraction through it (0 = fill on touch; at most 0.05). |
 | `portfolio.risk_per_trade` | 0.005 | Risk 0.5% of the account per trade (to the stop). |
 | `portfolio.max_open_positions` | 6 | Most trades open at once. |
 | `portfolio.max_total_risk` | 0.03 | All open trades together risk at most 3%. |
 | `portfolio.max_notional_frac` | 0.25 | No position larger than 25% of the account (no leverage). |
-| `portfolio.daily_loss_limit` | 0.02 | No new trades for the rest of the UTC day after a 2% realized loss. |
+| `portfolio.daily_loss_limit` | 0.02 | No new trades for the rest of the UTC day after a 2% realized loss. It rarely binds on 4h and is not a material protection. |
+| `portfolio.max_total_notional` | 1.0 | All open positions together at most 1x the account: no leverage. |
 | `paper.max_roster` | 4 | Strategies paper trading at once. |
 | `paper.starting_equity` | 10000 | Starting balance of each paper account. |
 | `research.validation_months` | 12 | Length of the locked validation period. |
+| `research.max_validations_per_week` | 3 | Validations in the last 7 days across Claude's cycles and the automatic sweep (`null` disables). |
+| `research.validation_universe` | `"point_in_time"` | Validation coins ranked by volume before the period, or `"current"` (today's list). |
+| `research.validation_gate.min_validation_edge_r` / `min_validation_edge_z` | 0.0 / 1.65 | Validation edge over random entries, and its z score (`null` drops a check). |
+| `graduation.min_edge_r` / `graduation.min_edge_z` | 0.0 / 1.65 | The same on the paper period. |
 | `brain.enabled` | `true` | `false` never calls Claude. |
 | `brain.model` | `"claude-opus-5-5"` | Claude model for every brain call. |
 | `brain.effort` / `brain.signal_effort` | `"high"` / `"medium"` | How hard Claude thinks in cycles and in signal reviews: `low`, `medium`, `high`, `xhigh` or `max`. |
 | `brain.signal_review` | `"shadow"` | `off`, `shadow` or `active` (see below). |
-| `brain.max_signal_reviews_per_day` | 40 | Cap on per-signal calls. |
+| `brain.max_signal_reviews_per_day` | 40 | Cap on per-signal Claude calls per rolling 24 hours. Failed calls (refusal, cut-off or malformed reply, API error) count too, and a signal is given up after 2 failed attempts. |
 | `brain.research_every_hours` / `brain.review_every_hours` | 168 / 24 | Weekly research, daily review. |
+| `brain.max_tokens` | 64000 | Output tokens per reply in cycles, thinking included. Replies are streamed, so values above 21,000 are fine; 64,000 is recommended. |
+| `brain.max_iterations` / `brain.review_max_iterations` | 60 / 20 | Model turns per research / review cycle. |
+| `brain.review_effort` | `"medium"` | How hard Claude thinks in review cycles. |
+| `brain.max_cycle_minutes` | 60 | Wall-clock limit of one cycle; it then gets one wrap-up reply (`0` or `null` = no limit). |
+| `brain.max_retries` | 8 | SDK retries per request (it honours retry-after). |
+| `brain.signal_max_tokens` | 16000 | Output tokens per signal review, thinking included (at most 21,000). |
+| `brain.max_monthly_output_tokens` | `null` (off) | Monthly cap on output tokens. When reached, brain calls stop until next month and the automatic sweep stands in. |
 
 **Signal review modes:**
 
@@ -484,19 +627,35 @@ The settings you are most likely to change (all defaults are in `fibbot/config.p
 - `active`: signals Claude says to skip are not traded on paper. A late "skip" never removes a
   trade that already filled.
 
+Setups whose order already filled (or closed) are not reviewed: a late skip could not remove them
+and would be scored with hindsight. The track record Claude sees for a signal (paper trades and
+its own past reviews) is as it stood at the signal's candle.
+
+**Claude's journal.** Every cycle writes a journal entry with its summary, the tools it used and
+its token usage. A cycle cut off by its turn cap, its output limit or `brain.max_cycle_minutes`
+ends with one extra reply that writes the notebook entry and the summary; the entry shows the cap,
+effort, resumes and whether it wrapped up.
+
 The gate thresholds (`research.validation_gate` and `graduation`) can be changed too. Loosening
 them makes "reliably profitable" mean less.
 
 ## Limitations
 
-- **Survivorship bias.** The coin list is today's top coins with at least a year of history. Coins
-  that crashed out of the top ranks are missing from the backtests, so backtests look better than
-  reality would have been. Paper trading uses the ranking as it changes, which removes this bias
-  from that point on.
+- **Survivorship bias.** The research period uses today's top coins with at least a year of
+  history. Coins that crashed out of the top ranks are missing, and today's top coins rallied
+  into it, so long backtests look better than reality would have been. Judge research results on
+  their edge over random entries, not on the raw average trade. The validation period uses the
+  coins as they stood before it started (by trading volume; the pool is the coins the bot has seen,
+  cached coins and the static list) and must beat random entries. Paper trading uses the ranking
+  as it changes, which removes the bias from that point on.
 - **Candles hide what happened inside them.** The simulator only sees open, high, low and close.
   It resolves every unclear candle against the trade (stop before target, no entry on the candle
-  that made the high). That is cautious but still an estimate. A limit order is counted as filled
-  as soon as price touches it; on a real exchange a touch may not fill you.
+  that made the high). That is cautious but still an estimate. A limit entry needs price to trade
+  0.02% through it, which models "a touch may not fill you"; on 6 coins this costs
+  `golden_pocket_4h` about 15% of its total R. Targets still fill on a touch.
+- **Tight stops and costs.** On 1h, stops are often so close that fees and slippage take a large
+  part of every R. `min_stop_cost_mult` filters such setups; it has not made the 1h presets
+  profitable.
 - **Fees and slippage are assumptions.** 0.1% per side and 0.05% slippage suit liquid coins on a
   normal day. In a fast market, real slippage can be many times larger. The bid-ask spread is not
   modelled beyond that.

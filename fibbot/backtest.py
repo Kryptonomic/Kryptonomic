@@ -3,9 +3,14 @@ and summarize (pure, no network).
 
 run_strategy replays FibEngine per symbol on bars.window(start_t, end_t, warmup_bars(spec)) with
 trade_start_t=start_t, optionally in a process pool. backtest() adds the portfolio simulation and
-the statistics. Trade statistics (metrics, per_symbol, per_year) use CLOSED trades; a position
-still open at the end of the window is kept in `trades`, sized by the portfolio and marked into
-final_equity, and counted in metrics["n_open"].
+the statistics. Trade statistics (metrics, per_symbol, per_year, by_side) use CLOSED trades; a
+position still open at the end of the window is kept in `trades`, sized by the portfolio and marked
+into final_equity, and counted in metrics["n_open"].
+
+Account statistics (max_drawdown, sharpe, sortino, calmar) are computed on the MARK-TO-MARKET
+equity curve (portfolio.marked_curve: every open position marked at every bar close, partial fills
+at their fill time) when the bars are known, as in backtest(); a give-back inside an open trade is
+a drawdown even if the trade closes in profit. PortfolioResult.curve stays the realized curve.
 """
 from __future__ import annotations
 
@@ -13,11 +18,11 @@ import math
 import os
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 
 from .metrics import equity_stats, trade_stats
-from .portfolio import PortfolioResult, simulate_portfolio
+from .portfolio import PortfolioResult, marked_curve, simulate_portfolio
 from .strategy import FibEngine, RunResult, StrategySpec, warmup_bars
 from .types import TF_SECONDS, Bars, Costs, Trade
 
@@ -43,15 +48,20 @@ def iso_day(t: int | None) -> str | None:
     return None if t is None else datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+COST_FIELDS = tuple(f.name for f in fields(Costs))
+
+
 def as_spec(spec: StrategySpec | dict) -> StrategySpec:
     """A validated StrategySpec from a spec or its dict (ValueError if invalid)."""
     return (spec if isinstance(spec, StrategySpec) else StrategySpec.from_dict(spec)).validate()
 
 
 def costs_from_cfg(cfg: dict) -> Costs:
-    """Costs from cfg["costs"] (missing keys keep the Costs defaults)."""
+    """Costs from cfg["costs"] (missing keys keep the Costs defaults). Reads every Costs field
+    (fee_rate, slippage, limit_through), like paper's frozen account costs, so backtests,
+    research and paper price fills the same way."""
     c = cfg.get("costs") or {}
-    return Costs(**{k: float(c[k]) for k in ("fee_rate", "slippage") if k in c})
+    return Costs(**{k: float(c[k]) for k in COST_FIELDS if k in c})
 
 
 def resolve_workers(n: int | None) -> int:
@@ -108,7 +118,10 @@ def data_period(bars_by_symbol: dict[str, Bars], start_t: int | None,
 @dataclass
 class BacktestResult:
     """One spec over many symbols and one window. metrics = trade_stats(closed trades) |
-    equity_stats(portfolio curve from period start to end, ending at final_equity) | {"n_open"}."""
+    equity_stats(equity_curve) | {"n_open"}. equity_curve runs from the period start (start
+    equity) to the period end (final, marked equity): the mark-to-market curve when the bars were
+    given (equity_basis "marked"), else the realized exits ("realized"). by_side = {"long",
+    "short"} trade-stat rows, only for direction "both"."""
     spec: dict
     spec_id: str
     start_t: int | None
@@ -120,6 +133,9 @@ class BacktestResult:
     per_symbol: dict[str, dict]         # every symbol: {"n", "total_r", "avg_r", "win_rate", "profit_factor"}
     per_year: dict[str, dict]           # {"2023": {"n", "total_r", "avg_r"}} by UTC entry year
     period: tuple[int | None, int | None] = (None, None)   # data_period(...)
+    equity_curve: list[tuple[int, float]] = field(default_factory=list)   # what equity_stats saw
+    by_side: dict[str, dict] | None = None   # direction "both": {"long": lite, "short": lite}
+    equity_basis: str = "realized"           # "marked" | "realized": what equity_curve is
 
     @property
     def closed_trades(self) -> list[Trade]:
@@ -133,7 +149,7 @@ class BacktestResult:
         if omitted:
             rows = rows[:max_symbols - max_symbols // 2] + rows[len(rows) - max_symbols // 2:]
         pf = self.portfolio
-        return rounded({
+        out = {
             "spec_id": self.spec_id, "name": self.spec.get("name"),
             "timeframe": self.spec.get("timeframe"), "direction": self.spec.get("direction"),
             "period": {"start": iso_day(self.period[0]), "end": iso_day(self.period[1])},
@@ -141,24 +157,36 @@ class BacktestResult:
             "metrics": self.metrics,
             "portfolio": {"start_equity": pf.start_equity, "final_equity": pf.final_equity,
                           "realized_equity": pf.realized_equity, "n_taken": len(pf.taken),
-                          "skipped": dict(Counter(s["reason"] for s in pf.skipped))},
+                          "skipped": dict(Counter(s["reason"] for s in pf.skipped)),
+                          "equity_basis": self.equity_basis},
             "per_symbol": dict(rows), "per_symbol_omitted": omitted,
             "per_year": self.per_year,
-        })
+        }
+        if self.by_side is not None:
+            out["by_side"] = self.by_side
+        return rounded(out)
 
 
 def result_from_trades(spec: StrategySpec | dict, trades: list[Trade], symbols: list[str],
                        start_t: int | None, end_t: int | None, cfg: dict,
-                       period: tuple[int | None, int | None] | None = None) -> BacktestResult:
+                       period: tuple[int | None, int | None] | None = None,
+                       bars_by_symbol: dict[str, Bars] | None = None) -> BacktestResult:
     """Assemble a BacktestResult: sort the trades, simulate the portfolio (cfg["portfolio"]) and
-    compute metrics. The equity curve for equity_stats runs from period[0] (start equity) through
-    the realized exits to period[1] (final, marked equity); period defaults to (start_t, end_t)."""
+    compute metrics. The equity curve for equity_stats runs from period[0] (start equity) to
+    period[1] (final, marked equity); period defaults to (start_t, end_t). In between it is the
+    mark-to-market curve (portfolio.marked_curve with cfg["costs"], open trades marked before
+    end_t) when bars_by_symbol is given, else the realized exits."""
     spec = as_spec(spec)
     trades = sorted(trades, key=lambda tr: (tr.entry_t, tr.symbol, tr.leg_id))
     closed = [tr for tr in trades if tr.exit_t is not None]
     pf = simulate_portfolio(trades, cfg.get("portfolio"))
     lo, hi = period or (start_t, end_t)
-    curve = ([(lo, pf.start_equity)] if lo is not None else []) + list(pf.curve)
+    if bars_by_symbol is not None:
+        costs = costs_from_cfg(cfg)
+        inner, basis = marked_curve(pf, bars_by_symbol, costs.fee_rate, costs.slippage, end_t), "marked"
+    else:
+        inner, basis = list(pf.curve), "realized"
+    curve = ([(lo, pf.start_equity)] if lo is not None else []) + inner
     if hi is not None:
         curve.append((hi, pf.final_equity))
     metrics = {**trade_stats(closed), **equity_stats(curve, pf.start_equity),
@@ -169,10 +197,17 @@ def result_from_trades(spec: StrategySpec | dict, trades: list[Trade], symbols: 
         by_year[datetime.fromtimestamp(tr.entry_t, tz=timezone.utc).strftime("%Y")].append(tr)
     per_year = {y: {k: v for k, v in _lite(ts).items() if k in ("n", "total_r", "avg_r")}
                 for y, ts in sorted(by_year.items())}
+    by_side = None
+    if spec.direction == "both":
+        # rows of ONE combined run (one position per symbol across both sides): a long-only or
+        # short-only backtest of the spec trades differently and is the test of a side
+        by_side = {name: _lite([tr for tr in closed if tr.side == s])
+                   for name, s in (("long", 1), ("short", -1))}
     return BacktestResult(spec=spec.to_dict(), spec_id=spec.spec_id(), start_t=start_t, end_t=end_t,
                           symbols=list(symbols), trades=trades, portfolio=pf, metrics=metrics,
                           per_symbol={s: _lite(by_sym.get(s, [])) for s in symbols},
-                          per_year=per_year, period=(lo, hi))
+                          per_year=per_year, period=(lo, hi), equity_curve=curve, by_side=by_side,
+                          equity_basis=basis)
 
 
 def backtest(spec: StrategySpec | dict, bars_by_symbol: dict[str, Bars], start_t: int | None,
@@ -186,4 +221,5 @@ def backtest(spec: StrategySpec | dict, bars_by_symbol: dict[str, Bars], start_t
                         workers=resolve_workers(workers))
     trades = [tr for r in runs.values() for tr in r.trades + ([r.open_trade] if r.open_trade else [])]
     return result_from_trades(spec, trades, list(bars_by_symbol), start_t, end_t, cfg,
-                              period=data_period(bars_by_symbol, start_t, end_t))
+                              period=data_period(bars_by_symbol, start_t, end_t),
+                              bars_by_symbol=bars_by_symbol)

@@ -32,8 +32,12 @@ USER_AGENT = "fibbot/0.1 (paper-trading research; +stdlib urllib)"
 HTTP_TIMEOUT = 30.0
 HTTP_TRIES = 5
 BACKOFF_BASE = 1.0               # seconds before the 2nd try; doubles after every failure
-BACKOFF_MAX = 60.0
-NO_RETRY_STATUS = frozenset({400, 404})
+BACKOFF_MAX = 60.0               # default longest wait between tries (http_json max_delay)
+# Fail at once, never retry: bad request / unknown symbol (400, 404), unauthorised (401), WAF or
+# regional block (403, 451 - permanent for this host) and a Binance IP ban (418, which retrying
+# only lengthens). Retrying these just burns scheduled-run minutes.
+NO_RETRY_STATUS = frozenset({400, 401, 403, 404, 418, 451})
+CLOSED_MARGIN_MS = 5000          # a Binance bar counts as closed once closeTime < now - this (clock skew)
 BINANCE_LIMIT = 1000             # max klines per Binance request
 OKX_LIMIT = 100                  # max candles per OKX history-candles request
 OKX_BARS = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc"}
@@ -43,7 +47,8 @@ _SYMBOL_RE = re.compile(r"[A-Z0-9]{2,30}")
 
 
 class FetchError(RuntimeError):
-    """A request failed (after all retries, or at once for HTTP 400/404). `status`: HTTP code or None."""
+    """A request failed: after all retries, or at once for a NO_RETRY_STATUS code or a Retry-After
+    longer than the caller will wait. `status`: HTTP code or None."""
 
     def __init__(self, msg: str, status: int | None = None):
         super().__init__(msg)
@@ -51,11 +56,14 @@ class FetchError(RuntimeError):
 
 
 def http_json(url: str, params: dict | None = None, timeout: float = HTTP_TIMEOUT,
-              tries: int = HTTP_TRIES):
+              tries: int = HTTP_TRIES, max_delay: float = BACKOFF_MAX):
     """GET `url` (+ query `params`) and decode the JSON body.
 
-    Transient failures (connection errors, timeouts, 5xx, 418/429, bad JSON) are retried with
-    exponential backoff that honours Retry-After; HTTP 400/404 fail immediately. Raises FetchError.
+    Transient failures (connection errors, timeouts, 5xx, 429, other 4xx, bad JSON) are retried
+    up to `tries` times with exponential backoff that honours Retry-After; no single wait exceeds
+    `max_delay` seconds, and a Retry-After longer than that gives up at once (retrying early only
+    earns another refusal). NO_RETRY_STATUS codes (400, 401, 403, 404, 418, 451) fail immediately.
+    Raises FetchError.
     """
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
@@ -74,12 +82,17 @@ def http_json(url: str, params: dict | None = None, timeout: float = HTTP_TIMEOU
             if e.code in NO_RETRY_STATUS:
                 raise FetchError(f"HTTP {e.code} for {url}: {_error_body(e)}", e.code) from e
             last, status = e, e.code
-            delay = max(delay, _retry_after(e))
+            wait = _retry_after(e)
+            if wait > max_delay:
+                raise FetchError(f"HTTP {e.code} for {url}: Retry-After {wait:.0f}s exceeds the"
+                                 f" {max_delay:.0f}s wait limit", e.code) from e
+            delay = max(delay, wait)
         except (OSError, ValueError, EOFError, http.client.HTTPException) as e:
             last, status = e, None
         if attempt + 1 < tries:
-            log.info("retrying %s in %.0fs after: %s", url, min(delay, BACKOFF_MAX), last)
-            time.sleep(min(delay, BACKOFF_MAX))
+            delay = min(delay, max_delay)
+            log.info("retrying %s in %.0fs after: %s", url, delay, last)
+            time.sleep(delay)
     raise FetchError(f"{url} failed after {tries} tries: {last}", status) from last
 
 
@@ -126,11 +139,15 @@ def _tf_seconds(tf: str) -> int:
 # Downloads
 
 
-def fetch_klines(cfg: dict, symbol: str, tf: str, start_t: int, end_t: int | None = None) -> list[tuple]:
+def fetch_klines(cfg: dict, symbol: str, tf: str, start_t: int, end_t: int | None = None,
+                 fallback_start_t: int | None = None) -> list[tuple]:
     """Closed bars with start_t <= t < end_t (default: up to now) as [(t, o, h, l, c, v), ...], t in seconds.
 
-    Binance spot klines, paginated by startTime in pages of 1000. If Binance fails and the range
-    starts at most OKX_FALLBACK_MAX_BARS bars ago, OKX history-candles is tried instead.
+    Binance spot klines, paginated by startTime in pages of 1000; a bar counts as closed once its
+    closeTime is CLOSED_MARGIN_MS before the local clock. If Binance fails and the fallback range
+    starts at most OKX_FALLBACK_MAX_BARS bars ago, OKX history-candles is tried instead, from
+    `fallback_start_t` (default start_t, never earlier): CandleStore.update re-fetches its newest
+    cached bar from Binance only, so a different exchange's prices never overwrite a cached bar.
     """
     tf_s = _tf_seconds(tf)
     now_ms = int(time.time() * 1000)
@@ -141,17 +158,21 @@ def fetch_klines(cfg: dict, symbol: str, tf: str, start_t: int, end_t: int | Non
     try:
         return _binance_klines(cfg, symbol, tf, start_ms, end_ms, now_ms)
     except FetchError as e:
-        if start_ms < now_ms - OKX_FALLBACK_MAX_BARS * tf_s * 1000:
+        fb_ms = start_ms if fallback_start_t is None else max(start_ms, int(fallback_start_t) * 1000)
+        if fb_ms < now_ms - OKX_FALLBACK_MAX_BARS * tf_s * 1000:
             raise
         log.warning("Binance klines failed for %s %s (%s); trying OKX", symbol, tf, e)
         try:
-            return _okx_candles(cfg, symbol, tf, start_ms, end_ms, now_ms)
+            return _okx_candles(cfg, symbol, tf, fb_ms, end_ms, now_ms)
         except FetchError as e2:
             raise FetchError(f"Binance: {e}; OKX: {e2}", e2.status) from e2
 
 
 def _binance_klines(cfg, symbol, tf, start_ms, end_ms, now_ms) -> list[tuple]:
-    """Rows: [openTime ms, open, high, low, close, volume, closeTime ms, ...]; forming bars dropped."""
+    """Rows: [openTime ms, open, high, low, close, volume, closeTime ms, ...]; forming bars dropped.
+
+    Closed means closeTime < now_ms - CLOSED_MARGIN_MS: the local clock may run a little ahead of
+    the exchange, and a bar kept while still forming would carry a partial high/low/close."""
     url = f"{cfg['data']['binance_base']}/api/v3/klines"
     step = TF_SECONDS[tf] * 1000
     out, cursor = [], start_ms
@@ -162,7 +183,7 @@ def _binance_klines(cfg, symbol, tf, start_ms, end_ms, now_ms) -> list[tuple]:
             raise FetchError(f"unexpected Binance klines response for {symbol}: {str(page)[:200]}")
         for r in page:
             t_ms = int(r[0])
-            if int(r[6]) < now_ms and cursor <= t_ms < end_ms:
+            if int(r[6]) < now_ms - CLOSED_MARGIN_MS and cursor <= t_ms < end_ms:
                 out.append((t_ms // 1000, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
         if len(page) < BINANCE_LIMIT:
             break
@@ -261,10 +282,24 @@ class CandleStore:
         return bars
 
     def update(self, symbol: str, tf: str) -> Bars:
-        """Fetch bars after the last cached one (or from data.history_start), merge, save, return all."""
+        """Fetch bars from the last cached one (or from data.history_start), merge, save, return all.
+
+        The newest cached bar is fetched again and replaced (with a warning) if Binance now reports
+        different values, e.g. it was stored while still forming because the local clock ran ahead
+        of the exchange; otherwise such a bar would stay partial forever. Only Binance may revise
+        it (the OKX fallback starts at the next bar), and an unchanged re-fetch rewrites nothing.
+        """
         old = self.get(symbol, tf)
-        start = old.last_t + TF_SECONDS[tf] if len(old) else parse_day(self.cfg["data"]["history_start"])
-        rows = fetch_klines(self.cfg, symbol, tf, start)
+        if len(old):
+            last_t = old.last_t
+            rows = fetch_klines(self.cfg, symbol, tf, last_t, fallback_start_t=last_t + TF_SECONDS[tf])
+            cached = (last_t, old.o[-1], old.h[-1], old.l[-1], old.c[-1], old.v[-1])
+            rows = [r for r in rows if tuple(r) != cached]
+            if any(r[0] == last_t for r in rows):
+                log.warning("re-fetched %s %s bar t=%d differs from the cached copy (stored before it"
+                            " closed?); replacing it", symbol, tf, last_t)
+        else:
+            rows = fetch_klines(self.cfg, symbol, tf, parse_day(self.cfg["data"]["history_start"]))
         if not rows:
             return old
         merged = Bars.from_rows(symbol, tf, chain(zip(old.t, old.o, old.h, old.l, old.c, old.v), rows))

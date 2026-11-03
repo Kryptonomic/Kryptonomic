@@ -73,8 +73,10 @@ class Trade:
     """One round-trip trade produced by the strategy engine (single symbol, single position).
 
     ret_pct is the NET return on the entry notional, after fees and slippage, signed
-    (+0.03 = +3% of notional). risk_pct = |entry_price - stop_price| / entry_price using the
-    INITIAL stop. r_multiple = ret_pct / risk_pct. An open trade has exit_t=None,
+    (+0.03 = +3% of notional). risk_pct = side * (entry_price - stop_price) / entry_price using
+    the INITIAL stop; if the entry filled at or beyond the stop (the bar opened through it, an
+    immediate stop-out) it is the PLANNED risk of the order, side * (order_px - stop) / order_px,
+    so R stays meaningful. r_multiple = ret_pct / risk_pct. An open trade has exit_t=None,
     exit_reason="open", and exit_price/ret_pct marked at the last close.
     """
     strategy_id: str
@@ -136,6 +138,20 @@ class Signal:
 
 @dataclass
 class Costs:
-    """Trading frictions. fee_rate per side on notional; slippage applied to market and stop fills."""
+    """Trading frictions. fee_rate per side on notional; slippage applied to market and stop fills.
+
+    limit_through: a resting limit ENTRY fills only when the bar trades at least this fraction
+    through its price (long: low <= px*(1-limit_through); short: high >= px*(1+limit_through)),
+    still at px or at the open if the bar opened beyond it. A bare touch of the level does not fill:
+    bars that just tag a level and reverse are the best trades and are the ones a queued limit
+    misses (adverse selection). 0 restores fill-on-touch. The default is 2 bp: stricter than a
+    one-tick rule on fine-tick coins (BTC, ETH), which errs on the conservative side."""
     fee_rate: float = 0.001
     slippage: float = 0.0005
+    limit_through: float = 0.0002
+
+    def __post_init__(self):
+        # a negative margin would fill limits before price reaches them (optimistic fills)
+        lt = self.limit_through
+        if isinstance(lt, bool) or not isinstance(lt, (int, float)) or not 0.0 <= lt <= 0.05:
+            raise ValueError(f"limit_through: must be a number in [0, 0.05], got {lt!r}")

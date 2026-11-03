@@ -33,7 +33,7 @@ from fibbot.fib import fib_table
 from fibbot.indicators import ema
 from fibbot.store import Store
 from fibbot.strategy import PRESETS, StrategySpec
-from fibbot.types import Bars, Signal, Trade
+from fibbot.types import TF_SECONDS, Bars, Signal, Trade
 
 H4 = 14400
 T_END = (int(time.time()) // H4) * H4 - H4          # open time of the newest closed 4h bar
@@ -78,25 +78,48 @@ def msg(content, stop="end_turn", usage=(100, 20, 50, 7)):
     return SimpleNamespace(content=list(content), stop_reason=stop, usage=u)
 
 
+_UNSET = object()
+
+
 class FakeRunner:
-    """Mimics BetaToolRunner: yields scripted messages and, after each, runs its tool_use blocks
-    through the provided tools (exceptions become error results, as in the SDK)."""
+    """Mimics BetaToolRunner: yields scripted messages and, after each tool_use reply, runs its
+    tool_use blocks through the provided tools (exceptions become error results, as in the SDK).
+    Like the SDK, generate_tool_call_response() runs them once and caches the tool_result message,
+    so calling it inside the loop body does not run the tools twice."""
 
     def __init__(self, kw: dict, script: list):
         self.kw, self.script, self.results = kw, script, []
+        self._last, self._cached, self.closed = None, _UNSET, False
 
     def __iter__(self):
         for step in self.script[:self.kw["max_iterations"]]:
             if isinstance(step, BaseException):
                 raise step
+            self._last, self._cached = step, _UNSET
             yield step
-            for b in step.content:
-                if b.type == "tool_use":
-                    try:
-                        tool = next(t for t in self.kw["tools"] if t.name == b.name)
-                        self.results.append((b.name, tool.call(b.input), False))
-                    except Exception as e:
-                        self.results.append((b.name, str(e), True))
+            if step.stop_reason == "tool_use":
+                self.generate_tool_call_response()
+
+    def generate_tool_call_response(self):
+        if self._cached is _UNSET:
+            blocks = []
+            for b in self._last.content:
+                if b.type != "tool_use":
+                    continue
+                try:
+                    tool = next(t for t in self.kw["tools"] if getattr(t, "name", None) == b.name)
+                    out = tool.call(b.input)
+                    self.results.append((b.name, out, False))
+                    blocks.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+                except Exception as e:
+                    self.results.append((b.name, str(e), True))
+                    blocks.append({"type": "tool_result", "tool_use_id": b.id, "content": str(e),
+                                   "is_error": True})
+            self._cached = {"role": "user", "content": blocks} if blocks else None
+        return self._cached
+
+    def close(self):
+        self.closed = True
 
 
 class FakeClient:
@@ -132,14 +155,55 @@ def api_error(cls, status: int):
     return cls(f"status {status}", response=httpx2.Response(status, request=req), body=None)
 
 
-def sdk_client(responses: list, requests: list) -> anthropic.Anthropic:
-    """A real SDK client whose HTTP layer replays `responses` (dicts = 200 JSON, ints = error
-    status) and records each request (headers, JSON body)."""
+def sse(events: list[dict]) -> str:
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+
+
+def sse_message(m: dict) -> str:
+    """An api_message dict as the server-sent events of a streamed reply. A tool_use block with
+    "partial_json" streams that raw (possibly cut-off) JSON instead of its input; a block
+    {"type": "error", "error": {"type", "message"}} ends the stream with that error event (a
+    mid-stream failure)."""
+    usage = m["usage"]
+    events = [{"type": "message_start", "message": {
+        **{k: v for k, v in m.items() if k not in ("content", "stop_reason", "usage")},
+        "content": [], "stop_reason": None,
+        "usage": {**usage, "output_tokens": 1}}}]
+    for i, b in enumerate(m["content"]):
+        if b["type"] == "error":
+            return sse(events + [{"type": "error", "error": b["error"]}])
+        if b["type"] == "text":
+            events += [{"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}},
+                       {"type": "content_block_delta", "index": i,
+                        "delta": {"type": "text_delta", "text": b["text"]}}]
+        else:
+            partial = b.get("partial_json", json.dumps(b["input"]))
+            events += [{"type": "content_block_start", "index": i, "content_block": {
+                            "type": "tool_use", "id": b["id"], "name": b["name"], "input": {}}},
+                       {"type": "content_block_delta", "index": i,
+                        "delta": {"type": "input_json_delta", "partial_json": partial}}]
+        events.append({"type": "content_block_stop", "index": i})
+    events += [{"type": "message_delta", "delta": {"stop_reason": m["stop_reason"], "stop_sequence": None},
+                "usage": {"output_tokens": usage["output_tokens"]}},
+               {"type": "message_stop"}]
+    return sse(events)
+
+
+def sdk_client(responses: list, requests: list, error: dict | None = None) -> anthropic.Anthropic:
+    """A real SDK client whose HTTP layer replays `responses` (dicts = 200 JSON, or server-sent
+    events when the request streams; ints = error status) and records each request (headers,
+    JSON body). `error` is the {"type", "message"} body of error responses."""
+    err = error or {"type": "api_error", "message": "x"}
+
     def handler(request):
-        requests.append((request.headers, json.loads(request.content)))
+        body = json.loads(request.content)
+        requests.append((request.headers, body))
         r = responses.pop(0)
         if isinstance(r, int):
-            return httpx2.Response(r, json={"type": "error", "error": {"type": "api_error", "message": "x"}})
+            return httpx2.Response(r, json={"type": "error", "error": err})
+        if body.get("stream"):
+            return httpx2.Response(200, headers={"content-type": "text/event-stream"},
+                                   content=sse_message(r).encode())
         return httpx2.Response(200, json=r)
     return anthropic.Anthropic(api_key="sk-test", base_url="http://anthropic.test", max_retries=0,
                                http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
@@ -229,10 +293,19 @@ class FakeLab:
     def notebook_append(self, text):
         self._call("notebook_append", text)
         self._notebook += f"\n## entry\n{text}\n"
+        return {"notebook_chars": len(self._notebook), "limit": 24000,
+                "free_chars": 24000 - len(self._notebook), "trimmed": [], "truncated": False}
 
     def notebook_rewrite(self, text):
         self._call("notebook_rewrite", text)
         self._notebook = text
+        return {"notebook_chars": len(text), "limit": 24000, "free_chars": 24000 - len(text)}
+
+    def windows(self, tf="4h"):
+        """Research window ends at the newest cached bar minus 30 bars (validation after it)."""
+        ts = [b.t[-1] for b in self._bars.values() if b.tf == tf and len(b)]
+        vs = (max(ts) if ts else T_END) - 30 * TF_SECONDS[tf]
+        return {"validation_start": vs, "research_end": vs}
 
 
 class TmpCase(unittest.TestCase):
@@ -387,7 +460,8 @@ class TestBrainClient(TmpCase):
         brain.run_agent("SYS", "hello", ["t1"])
         kw = fc.runner_kwargs[0]
         self.assertEqual(kw["model"], "claude-opus-5-5")
-        self.assertEqual(kw["max_tokens"], 16000)
+        self.assertEqual(kw["max_tokens"], self.cfg["brain"]["max_tokens"])
+        self.assertIs(kw["stream"], True)       # streamed, so max_tokens may exceed ~21k
         self.assertEqual(kw["system"], [{"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}])
         self.assertEqual(kw["messages"], [{"role": "user", "content": "hello"}])
         self.assertEqual(kw["tools"], ["t1"])
@@ -418,7 +492,7 @@ class TestBrainClient(TmpCase):
                   msg([text("Final summary."), text("Next: more.")], "end_turn", (20, 2, 8, None))]
         res = Brain(self.cfg, client=FakeClient(scripts=[script])).run_agent("S", "p", [])
         self.assertEqual(res, {"text": "Final summary.\nNext: more.", "stop_reason": "end_turn",
-                               "turns": 2, "refused": False,
+                               "turns": 2, "refused": False, "resumes": 0, "wrapped_up": False,
                                "usage": {"input_tokens": 30, "output_tokens": 3,
                                          "cache_read_input_tokens": 8, "cache_creation_input_tokens": 3}})
 
@@ -429,23 +503,37 @@ class TestBrainClient(TmpCase):
         self.assertEqual(res["text"], "")
 
     @mock.patch.object(client_mod.time, "sleep")
-    def test_transient_error_retried_once_before_any_reply(self, sleep):
+    def test_transient_error_retried_before_any_reply(self, sleep):
         fc = FakeClient(scripts=[[api_error(anthropic.RateLimitError, 429)], [msg([text("ok")])]])
-        self.assertEqual(Brain(self.cfg, client=fc).run_agent("S", "p", [])["text"], "ok")
+        res = Brain(self.cfg, client=fc).run_agent("S", "p", [])
+        self.assertEqual((res["text"], res["resumes"]), ("ok", 1))
         sleep.assert_called_once_with(client_mod.RETRY_SLEEP)
+        self.assertEqual(fc.runner_kwargs[1]["messages"], [{"role": "user", "content": "p"}])
+        # Persistent failure: every resume (with its backoff) fails, then BrainUnavailable.
+        n = len(client_mod.RESUME_SLEEPS) + 1
         fc = FakeClient(scripts=[[api_error(anthropic.InternalServerError, 529)],
-                                 [api_error(anthropic.APIConnectionError, 0)]])
-        with self.assertRaisesRegex(BrainUnavailable, "after a retry"):
+                                 [api_error(anthropic.APIConnectionError, 0)]] * n)
+        sleep.reset_mock()
+        with self.assertRaisesRegex(BrainUnavailable, "after retrying"):
             Brain(self.cfg, client=fc).run_agent("S", "p", [])
+        self.assertEqual(len(fc.runner_kwargs), n)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], list(client_mod.RESUME_SLEEPS))
 
     @mock.patch.object(client_mod.time, "sleep")
-    def test_no_retry_after_tools_ran(self, sleep):
-        script = [msg([tool_use("x", {})], "tool_use"), api_error(anthropic.InternalServerError, 500)]
-        fc = FakeClient(scripts=[script, [msg([text("never")])]])
-        with self.assertRaises(BrainUnavailable):
-            Brain(self.cfg, client=fc).run_agent("S", "p", [])
-        sleep.assert_not_called()
-        self.assertEqual(len(fc.runner_kwargs), 1)
+    def test_resume_after_tools_ran_keeps_the_conversation(self, sleep):
+        tool = CountingTool("x")
+        script = [msg([text("checking"), tool_use("x", {"a": 1}, "u1")], "tool_use", (10, 1, 0, 0)),
+                  api_error(anthropic.InternalServerError, 500)]
+        fc = FakeClient(scripts=[script, [msg([text("done")], "end_turn", (20, 2, 0, 0))]])
+        res = Brain(self.cfg, client=fc).run_agent("S", "p", [tool])
+        self.assertEqual((res["text"], res["turns"], res["resumes"]), ("done", 2, 1))
+        self.assertEqual(res["usage"]["input_tokens"], 30)       # cumulative over both runners
+        self.assertEqual(tool.calls, [{"a": 1}])                 # the tool ran once, not again
+        resumed = fc.runner_kwargs[1]
+        self.assertEqual(resumed["max_iterations"], 11)           # the cap counts earlier turns
+        self.assertEqual([m["role"] for m in resumed["messages"]], ["user", "assistant", "user"])
+        self.assertEqual(resumed["messages"][2]["content"][0]["tool_use_id"], "u1")
+        sleep.assert_called_once_with(client_mod.RESUME_SLEEPS[0])
 
     @mock.patch.object(client_mod.time, "sleep")
     def test_auth_and_client_errors(self, sleep):
@@ -469,14 +557,32 @@ class TestBrainClient(TmpCase):
         kw = fc.create_kwargs[0]
         self.assertEqual(kw["output_config"], {"effort": "medium",
                                                "format": {"type": "json_schema", "schema": SIGNAL_SCHEMA}})
-        self.assertEqual((kw["max_tokens"], kw["thinking"], kw["fallbacks"]), (4000, {"type": "adaptive"}, "default"))
-        for k in FORBIDDEN + ("tools", "cache_control"):
+        # Thinking counts toward max_tokens, so the default leaves room for it (was 4000).
+        self.assertEqual((kw["max_tokens"], kw["thinking"], kw["fallbacks"]),
+                         (client_mod.SIGNAL_MAX_TOKENS, {"type": "adaptive"}, "default"))
+        self.assertGreaterEqual(client_mod.SIGNAL_MAX_TOKENS, 16000)
+        for k in FORBIDDEN + ("tools", "cache_control", "stream"):
             self.assertNotIn(k, kw)
         self.assertIsNone(brain.structured("S", "p", SIGNAL_SCHEMA))
-        with self.assertLogs("fibbot.brain.client", "WARNING"):
+        self.assertEqual(brain.last_failure, "refusal")
+        with self.assertLogs("fibbot.brain.client", "WARNING") as logs:
             self.assertIsNone(brain.structured("S", "p", SIGNAL_SCHEMA, effort="low"))
+        self.assertIn("cut off at max_tokens", logs.output[0])
+        self.assertEqual(brain.last_failure, "max_tokens")
         self.assertEqual(fc.create_kwargs[2]["output_config"]["effort"], "low")
         self.assertIsNone(brain.structured("S", "p", SIGNAL_SCHEMA), "non-object JSON")
+        self.assertEqual(brain.last_failure, "not an object")
+
+
+class CountingTool:
+    """A minimal runnable tool for FakeRunner: records its inputs."""
+
+    def __init__(self, name: str, out: str = '{"ok":true}'):
+        self.name, self.out, self.calls = name, out, []
+
+    def call(self, inp):
+        self.calls.append(inp)
+        return self.out
 
 
 class TestRealSdkWiring(TmpCase):
@@ -503,6 +609,7 @@ class TestRealSdkWiring(TmpCase):
         headers, body = requests[0]
         self.assertIn("server-side-fallback-2026-07-01", headers["anthropic-beta"])
         self.assertEqual(body["model"], "claude-opus-5-5")
+        self.assertIs(body["stream"], True)
         self.assertEqual(body["thinking"], {"type": "adaptive"})
         self.assertEqual(body["output_config"], {"effort": "high"})
         self.assertEqual(body["fallbacks"], "default")
@@ -730,15 +837,19 @@ class TestCycles(TmpCase):
         self.assertEqual(self.lab.store.journal(), [])
 
     def test_refusal_and_iteration_cap_titles(self):
+        wrap = [msg([text("Wrapped up."), tool_use("append_notebook", {"entry": "cap hit"}, "w")], "tool_use")]
         fc = FakeClient(scripts=[[msg([text("no")], "refusal")],
-                                 [msg([tool_use("get_lab_status", {})], "tool_use")] * 20])
+                                 [msg([tool_use("get_lab_status", {})], "tool_use")] * 20, wrap])
         brain = Brain(self.cfg, client=fc)
         self.assertTrue(research_cycle(self.lab, brain)["refused"])
         self.assertEqual(self.lab.store.journal()[0]["title"], "Research cycle refused by the model")
         res = review_cycle(self.lab, brain)
-        self.assertEqual(res["turns"], 12)
+        self.assertEqual(res["turns"], 13)            # the 12-turn cap plus one wrap-up reply
+        self.assertTrue(res["wrapped_up"])
         self.assertEqual(self.lab.store.journal()[0]["title"],
                          "Review cycle: 0 promoted, 0 retired (stopped early: iteration cap)")
+        self.assertIn("Wrapped up.", self.lab.store.journal()[0]["body"])
+        self.assertIn("cap hit", self.lab.notebook())
 
 
 # -- signal reviews ------------------------------------------------------------------------------

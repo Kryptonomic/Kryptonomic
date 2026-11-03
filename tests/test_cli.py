@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = "deep_786_4h"
 CONFIG = {"research": {"workers": 1, "validation_months": 3, "folds": 3, "min_trades": 5,
                        "validation_gate": {"min_deflated_sharpe": 0.0, "min_profit_factor": 1.0,
-                                           "min_expectancy_r": 0.0}},
+                                           "min_expectancy_r": 0.0, "min_validation_edge_z": None}},
           "home": "/nonexistent/config/home"}
 
 
@@ -247,6 +247,10 @@ class TestResearchCommands(CliCase):
         self.assertIn("min_deflated_sharpe", out)
         self.assertTrue(self.json("validate", "--preset", SPEC)["passed"])
         sid = PRESETS[SPEC].spec_id()
+        # promotion also needs a research-window baseline with an edge over random entries
+        self.assertIn("no research-window baseline",
+                      self.user_error("promote", "--preset", SPEC, "--rationale", "r"))
+        self.ok("baseline", "--preset", SPEC)
         out = self.ok("promote", "--preset", SPEC, "--rationale", "tested")
         self.assertIn(f"promoted {SPEC} [{sid}] 4h: paper trading starts", out)
         row = self.store().get_strategy(sid)
@@ -269,6 +273,7 @@ class TestResearchCommands(CliCase):
 
     def test_promote_name_option(self):
         self.ok("validate", "--preset", SPEC)
+        self.ok("baseline", "--preset", SPEC)
         self.ok("promote", "--preset", SPEC, "--name", "my label", "--rationale", "r")
         self.assertEqual(self.store().roster()[0]["name"], "my label")
 

@@ -306,7 +306,8 @@ class TestCandleStore(ClockMixin, unittest.TestCase):
         first = self.store.update("BTCUSDT", "4h")
         self.now += 9 * H                                       # two more 4h bars close
         second = self.store.update("BTCUSDT", "4h")
-        self.assertEqual(self.fake.params("/api/v3/klines")[1]["startTime"], (first.last_t + 4 * H) * 1000)
+        # the newest cached bar is fetched again (F50: it may have been stored while still forming)
+        self.assertEqual(self.fake.params("/api/v3/klines")[1]["startTime"], first.last_t * 1000)
         self.assertEqual(len(second), len(first) + 2)
         self.assertEqual(second.t, list(range(LIST_T, forming_open(4 * H), 4 * H)))
         self.assertEqual(len(first), len(CandleStore(self.cfg).get("BTCUSDT", "4h")) - 2)
@@ -540,7 +541,9 @@ class TestGetUniverse(UniverseCase):
         with self.assertLogs("fibbot.data.universe", "WARNING"):
             got = get_universe(self.cfg(top_n=4, extra_exclude=["ETH"]))
         self.assertEqual(got, ["BTCUSDT", "XRPUSDT", "BNBUSDT", "SOLUSDT"])
-        self.assertFalse(os.path.exists(self.path()))
+        with open(self.path()) as f:                             # only a failure record (F34), no ranking
+            saved = json.load(f)
+        self.assertEqual((saved["as_of"], saved["symbols"], saved["failed_t"]), (0, [], U_NOW))
 
     def test_empty_ranking_falls_back(self):
         self.markets = [{"symbol": "usdt"}, {"symbol": "xyz"}]

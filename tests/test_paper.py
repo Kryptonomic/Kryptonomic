@@ -407,11 +407,26 @@ class TestBookkeeping(PaperTestCase):
         self.assertEqual(curve[0], (P, start))
         taken_closed = sorted((r for r in rows if r["status"] == "closed" and r["notional"] > 0),
                               key=lambda r: r["exit_t"])
-        self.assertEqual(len(curve), 1 + len(taken_closed))
-        self.assertEqual([t for t, _ in curve[1:]], [r["exit_t"] for r in taken_closed])
-        self.assertAlmostEqual(curve[-1][1], start + sum(r["pnl"] for r in taken_closed), places=6)
+        # F19: the stored curve is marked to market at every bar close a position is open (the
+        # basis of backtest()'s drawdown), so it holds every realized exit and more points
+        times = [t for t, _ in curve]
+        self.assertEqual(times, sorted(times))
+        self.assertGreater(len(curve), 1 + len(taken_closed))
+        self.assertTrue({r["exit_t"] for r in taken_closed} <= set(times))
         self.assertAlmostEqual(out["equity"], start + sum(r["pnl"] for r in rows), places=6)
+        self.assertAlmostEqual(curve[-1][1], out["equity"], places=6)     # the last mark is the equity
         self.assertEqual(out["open"], sum(r["status"] == "open" and r["notional"] > 0 for r in rows))
+
+    def test_marked_drawdown_matches_the_backtest(self):
+        # F19: paper drawdown is measured on the same mark-to-market curve as backtest()
+        from fibbot.backtest import backtest
+        self.tick()
+        acc = self.trader().account(SID, now_t=END)
+        bt = backtest(SPEC, {s: BARS[s] for s in SYMS}, P, END, self.cfg)
+        self.assertEqual(bt.equity_basis, "marked")
+        self.assertAlmostEqual(acc["equity"], bt.portfolio.final_equity, delta=0.01)   # rounded
+        self.assertGreater(bt.metrics["max_drawdown"], 0)
+        self.assertAlmostEqual(acc["max_drawdown"], bt.metrics["max_drawdown"], places=5)
 
     def test_portfolio_limits_skip_trades(self):
         iv = {s: [(tr.entry_t, tr.exit_t or math.inf) for tr in engine_trades(s)] for s in SYMS}

@@ -3,9 +3,9 @@
 real order.
 
 Output is plain-text tables; backtest, optimize, baseline, robustness, validate, status and sweep
-print JSON with --json. Exit codes: 0 ok; 1 user error (bad arguments or spec, unknown strategy,
-failed downloads or scheduler steps), printed without a traceback; 2 brain unavailable;
-130 interrupted.
+print JSON with --json. Exit codes: 0 ok; 1 user error (bad arguments, config or spec, unknown
+strategy, failed downloads, tick errors or failed scheduler steps, e.g. a candle stall), printed
+without a traceback; 2 brain unavailable; 130 interrupted.
 """
 from __future__ import annotations
 
@@ -124,6 +124,9 @@ def show_backtest(out: dict) -> str:
                               t["entry_t"], _f(t["entry_price"], "{:.6g}"), _f(t["stop_price"], "{:.6g}"),
                               t["exit_t"] or "-", _f(t["exit_price"], "{:.6g}"), t["exit_reason"],
                               _f(t["r_multiple"], R), t["bars_held"]] for t in out["trades"]])]
+    if out.get("holdout_looks"):
+        lines.append(f"holdout peek: look #{out['holdout_looks']} at this spec's locked period"
+                     " (counted as a trial)")
     lines.append(f"experiment #{out['experiment_id']}")
     return "\n".join(lines)
 
@@ -132,11 +135,27 @@ def show_validate(out: dict) -> str:
     gate = out["gate"]
     checks = [[c["name"], _f(c["value"]), _f(c["threshold"]), "yes" if c["passed"] else "NO"]
               for c in gate["checks"]]
+    base, pit = out.get("baseline") or {}, out.get("validation_universe") or {}
     lines = [_header("Validation", out),
              f"gate {'PASSED' if out['passed'] else 'FAILED'}: deflated Sharpe"
-             f" {_f(gate['deflated_sharpe'], '{:.3f}')} after {out['n_trials']} trials (Sharpe variance"
-             f" {_f(out['var_sr'])})", table(["check", "value", "threshold", "passed"], checks), "",
-             *_metrics(out["metrics"]), _portfolio(out["portfolio"]), "", *_folds(out)]
+             f" {_f(gate['deflated_sharpe'], '{:.3f}')} against {out.get('dsr_trials', out['n_trials'])}"
+             f" {out.get('dsr_basis', 'research')} trials (Sharpe variance {_f(out['var_sr'])};"
+             f" effective trades {_f(out.get('n_eff'), '{:.1f}')}; {out['n_trials']} research trials)",
+             table(["check", "value", "threshold", "passed"], checks)]
+    if base:
+        lines.append(f"random entries on this window: mean R {_f(base.get('baseline_avg_r_mean'), R)}"
+                     f" ({base.get('n_runs')} runs); edge {_f(base.get('edge_r'), R)} R"
+                     f" (z {_f(base.get('edge_z'), X2)}), regime-filtered edge"
+                     f" {_f(base.get('edge_regime_r'), R)} R; beats {_f(base.get('beats_frac'), '{:.0%}')}"
+                     " of the runs")
+    if pit:
+        lines.append(f"validation universe {pit.get('mode')} (ranked at {pit.get('ranked_at')}):"
+                     f" dropped {', '.join(pit.get('dropped') or []) or '-'}; added"
+                     f" {', '.join(pit.get('added') or []) or '-'}")
+    if "holdout_looks" in out:
+        lines.append(f"distinct looks at this spec's holdout: {out['holdout_looks']}"
+                     + (" (identical draw replayed)" if out.get("replay") else ""))
+    lines += ["", *_metrics(out["metrics"]), _portfolio(out["portfolio"]), "", *_folds(out)]
     if out["passed"]:
         lines.append("passed: put it on paper with 'promote' (same --preset/--spec) --rationale TEXT")
     lines.append(f"experiment #{out['experiment_id']}")
@@ -151,7 +170,7 @@ def show_optimize(out: dict) -> str:
              f" {out['n_invalid']} invalid), {out['n_folds']} folds, objective {out['objective']},"
              f" chosen combos need >= {out['min_is_trades']} in-sample trades",
              *(f"  invalid: {r}" for r in out["invalid_reasons"]),
-             f"out-of-sample: {oos['n']} trades, mean R {_f(oos['avg_r'], R)}, PF"
+             f"walk-forward held-out folds: {oos['n']} trades, mean R {_f(oos['avg_r'], R)}, PF"
              f" {_f(oos['profit_factor'], X2)}, win rate {_f(oos['win_rate'], PCT)}, total R"
              f" {_f(oos['total_r'], '{:+.1f}')}", "",
              table(["fold", "chosen on earlier folds", "IS n", "IS mean R", "OOS n", "OOS mean R"], folds),
@@ -196,9 +215,13 @@ def show_sweep(out: dict) -> str:
                     for r in out["ranking"]])]
     if out["validations"]:
         lines += ["", table(["validated", "passed", "n", "mean R", "PF", "deflated Sharpe", "failed checks"],
-                            [[v["preset"], _yes(v["passed"]), v["n"], _f(v["avg_r"], R),
-                              _f(v["profit_factor"], X2), _f(v["deflated_sharpe"], "{:.3f}"),
-                              ", ".join(v["failed"]) or "-"] for v in out["validations"]])]
+                            [[v["preset"] + (" (kept)" if v.get("reused") else ""), _yes(v["passed"]),
+                              v["n"], _f(v["avg_r"], R), _f(v["profit_factor"], X2),
+                              _f(v["deflated_sharpe"], "{:.3f}"), ", ".join(v["failed"]) or "-"]
+                             for v in out["validations"]])]
+        if any(v.get("reused") for v in out["validations"]):
+            lines.append("(kept) = verdict of an earlier validation on the current window (one look per period)")
+    lines += [f"not validated {s['preset']}: {s['reason']}" for s in out.get("skipped", [])]
     lines += [f"promoted {p['preset']} [{p['strategy_id']}], paper from {p['paper_start']}"
               for p in out["promoted"]]
     lines += [f"error: {e['preset']} {e['step']}: {e['error']}" for e in out["errors"]]
@@ -353,6 +376,9 @@ def cmd_presets(args, cfg) -> int:
 
 def cmd_backtest(args, cfg) -> int:
     spec = load_spec(args)
+    if args.window in ("validation", "all"):
+        print("warning: this looks at the locked validation period; it counts as a trial and as a"
+              " look at this spec's holdout (see FIBBOT.md)", file=sys.stderr)
     with open_lab(cfg) as lab:
         emit(args, lab.backtest(spec, args.window, args.symbols, trades=args.trades), show_backtest)
     return 0
@@ -412,9 +438,33 @@ def cmd_sweep(args, cfg) -> int:
     return 0
 
 
-def cmd_tick(args, cfg) -> int:
+def cmd_epoch(args, cfg) -> int:
+    """Show the pinned validation epoch, or --roll it forward by research.validation_months."""
     with open_lab(cfg) as lab:
-        print(show_tick(lab.paper().tick(update_data=True)))
+        if args.roll:
+            out = lab.roll_validation_epoch()
+            print(f"validation epoch rolled: the locked validation window now ends"
+                  f" {iso_day(out['validation_end'])} (was {iso_day(out['previous'])}); journaled")
+            return 0
+        epoch = lab.validation_epoch()
+    if epoch is None:
+        print("no validation epoch is pinned: the validation window slides with the data until the"
+              " first promotion")
+    else:
+        print(f"validation epoch: the locked validation window ends {iso_day(epoch['validation_end'])}"
+              f" ({epoch.get('reason', '')}); 'epoch --roll' moves it forward by"
+              f" {cfg['research']['validation_months']} months")
+    return 0
+
+
+def cmd_tick(args, cfg) -> int:
+    """Exit 1 when the tick reported errors (a strategy, a symbol or a candle download failed)."""
+    with open_lab(cfg) as lab:
+        out = lab.paper().tick(update_data=True)
+    print(show_tick(out))
+    if out["errors"]:
+        print(f"{len(out['errors'])} errors during the tick (listed above)", file=sys.stderr)
+        return EXIT_USER
     return 0
 
 
@@ -433,7 +483,9 @@ def cmd_brain(args, cfg) -> int:
             if lost:
                 raise BrainMissing(lost.removeprefix("brain unavailable: "))
             return 0
-        res = (cycles.research_cycle if args.action == "research" else cycles.review_cycle)(lab, brain)
+        fn = cycles.research_cycle if args.action == "research" else cycles.review_cycle
+        kw = {"stop": scheduler.cycle_stop(cfg)} if scheduler.accepts(fn, "stop") else {}
+        res = fn(lab, brain, **kw)
     if not res["ok"]:
         raise BrainMissing(res["error"])
     print(show_cycle(res))
@@ -507,7 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--grid", required=True, metavar="JSON_OR_FILE", help='{"param": [values, ...], ...}')
     add("baseline", cmd_baseline, "compare with random entries (same side, risk and management)",
         (spec, js)).add_argument("--runs", type=int, default=10, metavar="N")
-    add("robustness", cmd_robustness, "re-test with every parameter nudged one step", (spec, js))
+    add("robustness", cmd_robustness, "re-test with every parameter moved one step both ways"
+        " (duplicates of the base flagged)", (spec, js))
     add("validate", cmd_validate, "run the locked validation window and the validation gate", (spec, js))
     sp = add("promote", cmd_promote, "start paper trading a spec that passed validation", (spec,))
     sp.add_argument("--name", help="strategy name (default: the preset or spec name)")
@@ -519,6 +572,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--promote", action="store_true", help="put presets that pass on paper")
     sp.add_argument("--presets", nargs="+", choices=list(PRESETS), metavar="NAME",
                     help="default: every preset whose timeframe is in data.timeframes")
+    add("epoch", cmd_epoch, "show the pinned validation epoch (or roll it forward)").add_argument(
+        "--roll", action="store_true",
+        help="move the locked validation window forward by research.validation_months (journaled)")
     add("tick", cmd_tick, "update candles and advance the paper accounts once")
     add("brain", cmd_brain, "run a Claude brain cycle").add_argument(
         "action", choices=("research", "review", "signals"))

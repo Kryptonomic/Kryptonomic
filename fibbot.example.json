@@ -2,11 +2,26 @@
   "universe": {
     "top_n": 10
   },
+  "costs": {
+    "fee_rate": 0.001,
+    "slippage": 0.0005,
+    "limit_through": 0.0002
+  },
   "portfolio": {
-    "risk_per_trade": 0.0025
+    "risk_per_trade": 0.0025,
+    "max_total_notional": 1.0
+  },
+  "research": {
+    "max_validations_per_week": 3,
+    "validation_universe": "point_in_time",
+    "validation_gate": {
+      "min_validation_edge_r": 0.0,
+      "min_validation_edge_z": 1.65
+    }
   },
   "brain": {
     "signal_review": "shadow",
-    "effort": "medium"
+    "effort": "medium",
+    "max_cycle_minutes": 60
   }
 }

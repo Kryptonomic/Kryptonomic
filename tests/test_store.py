@@ -200,17 +200,17 @@ class TestExperiments(StoreCase):
 
 class TestTrials(StoreCase):
     def test_empty(self):
-        self.assertEqual(self.store.trial_stats(), {"n": 0, "var_sharpe": 0.0})
+        self.assertEqual(self.store.trial_stats(), {"n": 0, "var_sharpe": 0.0, "n_var": 0})
 
     def test_upsert_keeps_latest_and_population_variance(self):
         self.store.record_trial("a", 0.5)
-        self.assertEqual(self.store.trial_stats(), {"n": 1, "var_sharpe": 0.0})
+        self.assertEqual(self.store.trial_stats(), {"n": 1, "var_sharpe": 0.0, "n_var": 1})
         self.store.record_trial("b", 1.5)
         self.store.record_trial("c", None)
         self.store.record_trial("a", 1.0)      # latest sharpe replaces 0.5
         self.store.record_trial("d", -0.25)
         st = self.store.trial_stats()
-        self.assertEqual(st["n"], 4)
+        self.assertEqual((st["n"], st["n_var"]), (4, 3))
         self.assertAlmostEqual(st["var_sharpe"], statistics.pvariance([1.0, 1.5, -0.25]), places=12)
 
     def test_null_or_nan_does_not_erase_known_sharpe(self):
@@ -218,15 +218,15 @@ class TestTrials(StoreCase):
         self.store.record_trial("b", 2.0)
         self.store.record_trial("a", None)
         self.store.record_trial("b", float("nan"))
-        self.assertEqual(self.store.trial_stats(), {"n": 2, "var_sharpe": 1.0})
+        self.assertEqual(self.store.trial_stats(), {"n": 2, "var_sharpe": 1.0, "n_var": 2})
 
     def test_non_finite_and_null_sharpes_excluded_from_variance(self):
         self.store.record_trial("a", 1.0)
         self.store.record_trial("b", float("inf"))
         self.store.record_trial("c", None)
-        self.assertEqual(self.store.trial_stats(), {"n": 3, "var_sharpe": 0.0})
+        self.assertEqual(self.store.trial_stats(), {"n": 3, "var_sharpe": 0.0, "n_var": 1})
         self.store.record_trial("d", 3.0)
-        self.assertEqual(self.store.trial_stats(), {"n": 4, "var_sharpe": 1.0})
+        self.assertEqual(self.store.trial_stats(), {"n": 4, "var_sharpe": 1.0, "n_var": 2})
 
 
 class TestRoster(StoreCase):
@@ -284,32 +284,30 @@ class TestRoster(StoreCase):
             self.add(start=T0 + 999)
         self.assertEqual(self.store.get_strategy("s1")["paper_start_t"], T0)
 
-    def test_readding_retired_reactivates_with_fresh_account(self):
+    def test_readding_a_retired_strategy_raises_and_keeps_its_record(self):
+        # F08: retirement is final. Re-adding used to re-activate the id and DELETE its paper
+        # trades and equity curve, so a losing paper run could be erased and re-drawn without
+        # count_ever_on_paper (the graduation trial count) going up.
         self.add()
         self.store.upsert_paper_trade("s1", make_trade(exit_t=T0 + 1, exit_reason="stop"), 1000.0, -50.0)
         self.store.set_equity_curve("s1", [(T0, 10000.0), (T0 + 1, 9950.0)])
         self.store.add_signal(make_signal())
         self.store.set_signal_review("s1", "BTCUSDT", "L100", "skip", 0.7, "late", now_t=T0)
         self.store.set_strategy_status("s1", "retired", "bad", now_t=T0 + 10)
-        # other strategies' data must be untouched
-        self.add("s2")
-        self.store.upsert_paper_trade("s2", make_trade(strategy_id="s2"))
-        self.store.set_equity_curve("s2", [(T0, 10000.0)])
+        trades, curve = self.store.paper_trades("s1"), self.store.equity_curve("s1")
+        before = self.store.get_strategy("s1")
 
         new_spec = dict(self.SPEC, entry_zone_lo=0.5)
-        self.add(start=T0 + 5000, now=T0 + 4000, spec=new_spec, validation={"passed": True},
-                 rationale="retry", name="gp2")
-        row = self.store.get_strategy("s1")
-        self.assertEqual(row["status"], "paper")
-        self.assertEqual(row["paper_start_t"], T0 + 5000)
-        self.assertEqual(row["spec"], new_spec)
-        self.assertEqual((row["name"], row["rationale"], row["status_reason"]), ("gp2", "retry", ""))
-        self.assertEqual(row["validation"], {"passed": True})
-        self.assertEqual(self.store.paper_trades("s1"), [])
-        self.assertEqual(self.store.equity_curve("s1"), [])
+        with self.assertRaisesRegex(ValueError, r"retired on 2023-11-14 \(bad\); retirement is final"):
+            self.add(start=T0 + 5000, now=T0 + 4000, spec=new_spec, validation={"passed": True},
+                     rationale="retry", name="gp2")
+        self.assertEqual(self.store.get_strategy("s1"), before)
+        self.assertEqual(self.store.paper_trades("s1"), trades)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(self.store.equity_curve("s1"), curve)
         self.assertEqual(self.store.vetoed_legs("s1"), {("BTCUSDT", "L100")})
-        self.assertEqual(len(self.store.paper_trades("s2")), 1)
-        self.assertEqual(self.store.equity_curve("s2"), [(T0, 10000.0)])
+        self.assertEqual(self.store.count_ever_on_paper(), 1)
+        self.add("s2")                          # another id is a new strategy
         self.assertEqual(self.store.count_ever_on_paper(), 2)
 
     def test_count_ever_on_paper(self):
@@ -318,8 +316,11 @@ class TestRoster(StoreCase):
         self.add("b")
         self.store.set_strategy_status("a", "retired")
         self.assertEqual(self.store.count_ever_on_paper(), 2)
-        self.add("a", start=T0 + 1)
+        with self.assertRaises(ValueError):
+            self.add("a", start=T0 + 1)
         self.assertEqual(self.store.count_ever_on_paper(), 2)
+        self.add("c")
+        self.assertEqual(self.store.count_ever_on_paper(), 3)
 
 
 class TestPaperTrades(StoreCase):

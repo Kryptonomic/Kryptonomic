@@ -8,8 +8,10 @@ Lab and below, never here.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import math
 from datetime import datetime, timezone
 
 from ..backtest import rounded
@@ -28,9 +30,22 @@ METRIC_KEYS = ("n", "avg_r", "total_r", "win_rate", "profit_factor", "max_drawdo
                "sharpe_per_trade", "fold_positive_frac", "min_fold_avg_r", "edge_r", "beats_frac",
                "positive_frac", "median_avg_r", "worst_avg_r", "deflated_sharpe", "passed", "n_combos")
 BRIEF_KEYS = ("spec_id", "strategy_id", "experiment_id", "passed")
+EXACT_KEYS = frozenset({"spec", "params", "base_spec"})   # spec values copied back by the brain: never rounded
+# validate_strategy shows the brain only pass/fail, the gate checks and these headline numbers: a
+# per-symbol / per-year / per-fold breakdown of the held-out window would let it steer research
+# toward what happened to work there (the full result stays in the experiment row for humans).
+VALIDATION_KEYS = ("spec_id", "name", "timeframe", "direction", "window", "period", "n_symbols",
+                   "passed", "n_trials", "experiment_id")
+VALIDATION_METRICS = ("n", "n_open", "avg_r", "total_r", "win_rate", "profit_factor", "max_drawdown",
+                      "sharpe_per_trade")
+VALIDATION_HIDDEN = ("fold_positive_frac", "min_fold_avg_r")    # left out of validate rows too
+ROWS_RESERVE = 400           # chars kept free for the header/omitted note of a list_experiments reply
 SPEC_RULES = (
     "entry_zone_lo <= entry_zone_hi < stop_ratio",
     "tp1_ext < tp2_ext unless tp1_frac == 1 (then tp2_ext and trail_atr are unused)",
+    "min_rr is reward/risk before costs; min_stop_cost_mult (0-20) requires the stop to be at least"
+    " that many round-trip costs away (2*fee + slippage; + entry slippage in confirm mode): the lever"
+    " against tight 1h stops that costs eat",
     "swing_mult is used in atr swing mode, swing_pct in pct mode",
     "entry_at applies to limit entries; confirm_type and confirm_window to confirm entries",
     "trend_ema is unused when trend_filter is 'none'; adx_min 0 disables the ADX filter",
@@ -46,9 +61,24 @@ def iso(t: int | None) -> str | None:
     return datetime.fromtimestamp(int(t), tz=timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 
 
+def _prepare(x, exact: bool = False):
+    """rounded(x), except that values under EXACT_KEYS keep full precision (nan/inf -> None), so
+    a spec copied from a tool result keeps its spec_id."""
+    if isinstance(x, float):
+        if not math.isfinite(x):
+            return None
+        return x if exact else rounded(x)
+    if isinstance(x, dict):
+        return {k: _prepare(v, exact or k in EXACT_KEYS) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_prepare(v, exact) for v in x]
+    return x
+
+
 def to_json(obj, limit: int = MAX_RESULT_CHARS) -> str:
-    """Compact JSON of obj with floats rounded (nan -> null), cut to at most `limit` chars."""
-    s = json.dumps(rounded(obj), default=str, separators=(",", ":"))
+    """Compact JSON of obj with floats rounded (nan -> null; spec values under EXACT_KEYS keep
+    full precision), cut to at most `limit` chars."""
+    s = json.dumps(_prepare(obj), default=str, separators=(",", ":"))
     if len(s) <= limit:
         return s
     keep = limit - 60
@@ -87,12 +117,113 @@ def pick_metrics(m) -> dict:
 
 
 def experiment_row(r: dict) -> dict:
-    """Compact view of a store.list_experiments row."""
+    """Compact view of a store.list_experiments row (validate rows: headline metrics only, no
+    fold summaries of the held-out window)."""
     spec = r.get("spec") or {}
+    metrics = pick_metrics(r["metrics"])
+    if r["kind"] == "validate":
+        metrics = {k: v for k, v in metrics.items() if k not in VALIDATION_HIDDEN}
     return {"id": r["id"], "kind": r["kind"], "created": iso(r["created_t"]), "spec_id": r["spec_id"],
             "name": spec.get("name"), "params": spec_diff(spec),
             "window": [iso(r["window_start"]), iso(r["window_end"])],
-            "metrics": pick_metrics(r["metrics"]), "notes": (r.get("notes") or "")[:200]}
+            "metrics": metrics, "notes": (r.get("notes") or "")[:200]}
+
+
+def fit_rows(rows: list, limit: int = MAX_RESULT_CHARS - ROWS_RESERVE) -> tuple[list, int]:
+    """(the leading rows whose JSON fits in `limit` chars, how many were left out): whole rows
+    only, so a long listing is never cut mid-row into invalid JSON."""
+    kept, size = [], 2
+    for r in rows:
+        size += len(to_json(r, 10 ** 9)) + 1
+        if size > limit:
+            break
+        kept.append(r)
+    return kept, len(rows) - len(kept)
+
+
+def validation_view(out: dict) -> dict:
+    """What the brain sees of a Lab.validate result: pass/fail, the gate checks and headline
+    numbers (VALIDATION_KEYS / VALIDATION_METRICS); no per-symbol, per-year, fold or portfolio
+    breakdown of the held-out window."""
+    gate = out.get("gate") if isinstance(out.get("gate"), dict) else {}
+    m = out.get("metrics") if isinstance(out.get("metrics"), dict) else {}
+    checks = [{k: c.get(k) for k in ("name", "value", "threshold", "passed")}
+              for c in gate.get("checks") or [] if isinstance(c, dict)]
+    return {**{k: out[k] for k in VALIDATION_KEYS if k in out},
+            "metrics": {k: m[k] for k in VALIDATION_METRICS if k in m},
+            "gate": {"passed": gate.get("passed", out.get("passed")),
+                     "deflated_sharpe": gate.get("deflated_sharpe"), "checks": checks,
+                     **{k: gate[k] for k in ("n_eff", "t_clustered", "dsr_trials") if k in gate}},
+            "note": "only pass/fail, the gate checks and headline numbers are shown, by design"}
+
+
+def _same(a, b) -> bool:
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+        return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+    return a == b
+
+
+def _params_filter(params: dict) -> dict:
+    """Validated {StrategySpec field: value} filter for list_experiments(params=...)."""
+    if not isinstance(params, dict) or not params:
+        raise ValueError("params must be a non-empty object {parameter: value}")
+    unknown = sorted(set(params) - set(_DEFAULTS))
+    if unknown:
+        raise ValueError(f"unknown spec parameters: {', '.join(unknown)} (use spec={{\"preset\": ...}} "
+                         "for a preset; the \"name\" parameter matches the preset a spec started from)")
+    return params
+
+
+HIDDEN_SOURCES = ("cli-holdout",)   # operator backtests of the validation / all window
+
+
+def _accepts(fn, name: str) -> bool:
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _listing(store, **kw) -> list[dict]:
+    """store.list_experiments(**kw) without HIDDEN_SOURCES rows (filtered before the limit)."""
+    fn = store.list_experiments
+    if _accepts(fn, "exclude_sources"):
+        return fn(**kw, exclude_sources=HIDDEN_SOURCES)
+    limit = kw.pop("limit", None)
+    rows = [r for r in fn(**kw, limit=None) if r.get("source") not in HIDDEN_SOURCES]
+    return rows if limit is None else rows[:int(limit)]
+
+
+def _experiments_of(store, spec_id: str, kind: str | None) -> list[dict]:
+    """Every experiment of one spec_id (of `kind`), newest first (no HIDDEN_SOURCES rows)."""
+    if _accepts(store.list_experiments, "spec_id"):
+        return _listing(store, limit=None, kind=kind, spec_id=spec_id)
+    return [r for r in _listing(store, limit=None, kind=kind) if r.get("spec_id") == spec_id]
+
+
+def spec_lookup(store, spec_id: str, kind: str | None = None, limit: int = 50,
+                spec: dict | None = None) -> dict:
+    """One spec's record: its exact parameters (copy them to reuse the spec_id), its latest
+    validation (passed, failed checks), its roster status and its experiments (newest first)."""
+    rows = _experiments_of(store, spec_id, kind)
+    val = store.latest_validation(spec_id)
+    roster = store.get_strategy(spec_id)
+    if spec is None:
+        spec = next((r["spec"] for r in rows if r.get("spec")), None) or \
+            (val or {}).get("spec") or (roster or {}).get("spec")
+    vm = (val or {}).get("metrics") or {}
+    kept, omitted = fit_rows([experiment_row(r) for r in rows[:limit]],
+                             MAX_RESULT_CHARS - ROWS_RESERVE - len(to_json(spec, 10 ** 9)))
+    return {"spec_id": spec_id, "spec": spec, "n_experiments": len(rows),
+            "latest_validation": None if val is None else {
+                "experiment_id": val["id"], "created": iso(val["created_t"]),
+                "passed": vm.get("passed"),
+                "failed_checks": [c.get("name") for c in vm.get("checks") or []
+                                  if isinstance(c, dict) and not c.get("passed")]},
+            "roster": None if roster is None else {
+                "strategy_id": roster["strategy_id"], "name": roster["name"],
+                "status": roster["status"], "status_reason": roster.get("status_reason") or ""},
+            "experiments": kept, "omitted": omitted + max(0, len(rows) - limit)}
 
 
 def paper_trade_row(r: dict) -> dict:
@@ -209,7 +340,12 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
     def get_lab_status() -> str:
         """Current lab status: roster, cycle budget, data windows and trial statistics.
 
-        The roster lists each paper strategy with its paper account and graduation checks.
+        The roster lists each paper strategy with its paper account, its "validation"
+        {experiment_id, window, n, avg_r, profit_factor, deflated_sharpe} and its graduation:
+        status, summary, "checks" as [name, value, threshold, passed], "mean_r_ci" and
+        "evidence" (n_eff, design_effect, weeks, t_clustered). The status also has
+        validations_7d {used, cap}, holdout_peeks, validation_epoch (the pinned holdout, if
+        any), data_stall and system_events_7d (errors and warnings of the last 7 days).
         """
         return call("get_lab_status", lab.status)
 
@@ -224,19 +360,56 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
         return call("describe_strategy_space", lambda: strategy_space(lab.cfg))
 
     @beta_tool
-    def list_experiments(limit: int = 10, kind: str | None = None, sort_by: str = "recent") -> str:
+    def list_experiments(limit: int = 10, kind: str | None = None, sort_by: str = "recent",
+                         spec: dict | None = None, spec_id: str | None = None,
+                         params: dict | None = None) -> str:
         """Past experiments with their spec parameters and headline metrics.
 
-        Check this before testing an idea so you do not repeat work.
+        Check this before testing an idea so you do not repeat work. With spec or spec_id it
+        returns that spec's whole record: exact parameters, every experiment, latest validation
+        and roster status. With params it lists the experiments of every spec whose parameters
+        include those values. Validation results cannot be ranked: sort_by other than "recent"
+        rejects kind "validate" and leaves validation rows out. Operator backtests of the locked
+        validation period are never listed.
 
         Args:
             limit: Number of rows, 1-50.
             kind: Optional filter: backtest, optimize, baseline, validate, robustness or sweep.
             sort_by: "recent" (newest first), "avg_r" or "profit_factor" (best first).
+            spec: Optional spec (same format as run_backtest's spec) to look up.
+            spec_id: Optional spec_id to look up.
+            params: Optional parameter values every listed spec must have, e.g.
+                {"name": "golden_pocket_4h", "trend_ema": 100}.
         """
-        n = max(1, min(int(limit), 50))
-        return call("list_experiments", lambda: [
-            experiment_row(r) for r in lab.store.list_experiments(limit=n, kind=kind, sort_by=sort_by)])
+        def run():
+            n = max(1, min(int(limit), 50))
+            if kind == "validate" and sort_by != "recent":
+                raise ValueError("validation results cannot be ranked (use sort_by 'recent' with kind "
+                                 "'validate'): ranking held-out results would make the validation "
+                                 "window a search target")
+            if spec is not None or spec_id is not None:
+                parsed = parse_spec(spec) if spec is not None else None
+                sid = parsed.spec_id() if parsed is not None else str(spec_id).strip()
+                if parsed is not None and spec_id is not None and str(spec_id).strip() != sid:
+                    raise ValueError(f"spec has spec_id {sid}, not {spec_id}")
+                return spec_lookup(lab.store, sid, kind, n,
+                                   None if parsed is None else parsed.to_dict())
+            if params is not None:
+                want = _params_filter(params)
+                rows = [r for r in _listing(lab.store, limit=None, kind=kind)
+                        if all(_same((r.get("spec") or {}).get(k), v) for k, v in want.items())]
+            elif kind is None and sort_by != "recent":
+                rows = [r for r in _listing(lab.store, limit=None, sort_by=sort_by)
+                        if r["kind"] != "validate"]
+            else:
+                rows = _listing(lab.store, limit=n, kind=kind, sort_by=sort_by)
+            kept, omitted = fit_rows([experiment_row(r) for r in rows[:n]])
+            omitted += max(0, len(rows) - n)
+            if omitted:
+                kept.append({"omitted": omitted, "hint": "more rows match: ask for fewer, filter by "
+                                                          "kind, or look up one spec"})
+            return kept
+        return call("list_experiments", run)
 
     @beta_tool
     def run_backtest(spec: dict, window: str = "research", symbols: list[str] | None = None) -> str:
@@ -244,7 +417,11 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
 
         Runs across the universe (or a symbol subset). Returns trade statistics (n, avg_r,
         win_rate, profit_factor, ...), portfolio equity stats, per-symbol and per-year results and
-        walk-forward fold results. Costs 1 backtest unit.
+        walk-forward fold results. A direction "both" spec also gets "by_side" {long, short: n,
+        total_r, avg_r, win_rate, profit_factor}: rows of the one combined run (one position per
+        symbol), so before acting on one side backtest a direction-only spec (a new trial).
+        Costs 1 backtest unit. A symbol subset is a diagnostic only: validation, promotion and
+        paper trading always use the whole universe.
 
         Args:
             spec: Strategy parameters as a JSON object, e.g. {"timeframe": "4h",
@@ -267,9 +444,12 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
         """Anchored walk-forward optimization of a small parameter grid on the research window.
 
         Every combination is evaluated once; for each fold the best combination on earlier folds
-        is traded out-of-sample. Returns the out-of-sample stats, the chosen params per fold, the
-        best and top combinations and per-parameter sensitivity. Costs one backtest unit per
-        combination and every combination counts as a trial, so prefer few, meaningful values.
+        is traded on that fold ("oos": walk-forward, held-out-fold stats). Returns those stats, the
+        chosen params per fold, the best and top combinations and per-parameter sensitivity. The
+        folds are part of the research window, which run_backtest also shows you, so the
+        walk-forward result measures tuning stability, not independent evidence: only the locked
+        validation and paper trades are unseen. Costs one backtest unit per combination; every
+        combination with a distinct outcome counts as a trial, so prefer few, meaningful values.
 
         Args:
             base_spec: The spec the grid varies, same format as run_backtest's spec.
@@ -283,21 +463,35 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
         """Compare a spec with random entries on the research window.
 
         Each real trade is replayed from a random entry bar in the same symbol with the same side,
-        risk and management. Returns strategy_avg_r, the baseline mean/std, beats_frac (share of
-        random runs the strategy beats) and edge_r. A real edge beats the baseline clearly. Costs
-        1 backtest unit.
+        risk, entry cost and management. Returns strategy_avg_r, the baseline mean/std, beats_frac
+        (share of random runs the strategy beats), edge_r and baseline_z = edge_r / baseline std.
+        For a spec with a trend / ADX filter a second set of random entries is drawn only where
+        the filter passed: baseline_regime_avg_r_mean/std, edge_regime_r and edge_regime_z (they
+        repeat the uniform numbers when regime_filtered is false). edge_z / edge_regime_z are z
+        scores that also count the strategy's own (week-clustered) error. Judge the edge on
+        min(edge_r, edge_regime_r): either alone can be the lenient one; promotion requires it to
+        be > 0. A real edge has baseline_z of about 2 or more and beats_frac of at least 0.9.
+        Costs 1 backtest unit.
 
         Args:
             spec: Strategy parameters, same format as run_backtest's spec.
         """
-        return call("run_baseline", lambda: lab.baseline(parse_spec(spec)))
+        def run():
+            out = lab.baseline(parse_spec(spec))
+            edge, std = out.get("edge_r"), out.get("baseline_avg_r_std")
+            ok = isinstance(edge, (int, float)) and isinstance(std, (int, float)) and std > 0
+            return {**out, "baseline_z": edge / std if ok else None}
+        return call("run_baseline", run)
 
     @beta_tool
     def run_robustness(spec: dict) -> str:
-        """Re-test a spec with each active parameter moved one step either way (research window).
+        """Re-test a spec with every parameter moved one step both ways (research window).
 
-        Returns the share of neighbours with positive avg_r, their median and worst avg_r and one
-        row per neighbour. Costs one backtest unit per neighbour.
+        Up to 48 neighbours (see coverage / params_untested). Neighbours with the same trades as
+        the base or an earlier neighbour are flagged duplicate_of and excluded from positive_frac
+        (they are no-op moves, not trials). Returns the share of distinct neighbours with positive
+        avg_r, their median and worst avg_r and one row per neighbour. Costs one backtest unit per
+        neighbour plus one for the base spec.
 
         Args:
             spec: Strategy parameters, same format as run_backtest's spec.
@@ -310,32 +504,53 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
 
         The validation window is the most recent months, never used in research. Consumes one of
         the cycle's scarce validation tries and is recorded permanently. Only a spec that passes
-        can be promoted.
+        can be promoted. Returns pass/fail, the gate checks and headline numbers only, by design.
 
         Args:
             spec: Strategy parameters, same format as run_backtest's spec.
         """
-        return call("validate_strategy", lambda: lab.validate(parse_spec(spec)))
+        return call("validate_strategy", lambda: validation_view(lab.validate(parse_spec(spec))))
 
     @beta_tool
-    def promote_to_paper(spec: dict, name: str, rationale: str) -> str:
+    def promote_to_paper(name: str, rationale: str, spec: dict | None = None,
+                         spec_id: str | None = None) -> str:
         """Put a validated spec on forward paper trading.
 
         Paper trading starts at the next bar of its timeframe. Requires a passed validation of
-        exactly this spec and a free roster slot.
+        exactly this spec and a free roster slot. Give the spec, or just the spec_id of the
+        validated spec (its exact validated parameters are then used).
 
         Args:
-            spec: The validated strategy parameters (same spec_id as the validation).
             name: Short descriptive name, e.g. "gp_4h_trend".
             rationale: Why this strategy deserves paper capital: the evidence and what it adds
                 to the roster.
+            spec: The validated strategy parameters (same spec_id as the validation).
+            spec_id: The spec_id of the validated spec, instead of spec.
         """
-        return call("promote_to_paper", lambda: lab.promote(parse_spec(spec), name, rationale),
-                    name=name)
+        def run():
+            if spec is None and spec_id is None:
+                raise ValueError("give the validated spec or its spec_id")
+            if spec is not None:
+                parsed = parse_spec(spec)
+                if spec_id is not None and str(spec_id).strip() != parsed.spec_id():
+                    raise ValueError(f"spec has spec_id {parsed.spec_id()}, not {spec_id}")
+            else:
+                sid = str(spec_id).strip()
+                val = lab.store.latest_validation(sid)
+                if val is None or not val.get("spec"):
+                    raise ValueError(f"spec {sid} has no validation on record; run validate first")
+                parsed = StrategySpec.from_dict(val["spec"]).validate()
+                if parsed.spec_id() != sid:
+                    raise ValueError(f"the stored validation of {sid} holds spec {parsed.spec_id()}")
+            return lab.promote(parsed, name, rationale)
+        return call("promote_to_paper", run, name=name)
 
     @beta_tool
     def retire_strategy(strategy_id: str, reason: str) -> str:
-        """Stop paper trading a roster strategy. Its paper record is kept.
+        """Stop paper trading a roster strategy; retirement is final for this spec_id.
+
+        Its paper record is kept, and the spec can never be promoted again (a variant with a
+        changed parameter is a new strategy).
 
         Args:
             strategy_id: The roster strategy_id.
@@ -363,9 +578,10 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
 
     @beta_tool
     def get_market_context(symbol: str, timeframe: str = "4h") -> str:
-        """Current market summary for one symbol from cached closed candles.
+        """Market summary for one symbol as of the end of the research window.
 
-        Returns over 1/7/30 bars, ATR%, close vs EMA50/EMA200, RSI, ADX, the 30-bar range and
+        Built from cached closed candles; the locked validation period is hidden from research
+        and review cycles. Returns over 1/7/30 bars, ATR%, close vs EMA50/EMA200, RSI, ADX, the 30-bar range and
         closes, the latest confirmed swing pivots and the current leg with its Fibonacci levels.
 
         Args:
@@ -379,7 +595,9 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
             bars = lab.bars(timeframe, [sym]).get(sym)
             if not bars:
                 raise ValueError(f"no cached {timeframe} candles for {sym}")
-            return market_context(bars)
+            upto = int(lab.windows(timeframe)["validation_start"]) - 1
+            return {**market_context(bars, upto_t=upto),
+                    "as_of": iso(upto + 1) + " (end of the research window)"}
         return call("get_market_context", run)
 
     @beta_tool
@@ -402,29 +620,28 @@ def build_tools(lab, cycle: str, actions: list | None = None) -> list:
     def append_notebook(entry: str) -> str:
         """Append a timestamped entry to the research notebook.
 
-        The oldest entries are trimmed when the notebook grows beyond its size limit.
+        Dated entries are trimmed oldest first when the notebook exceeds its size limit;
+        undated sections written by rewrite_notebook are never trimmed. When they leave no room
+        the append fails: condense with rewrite_notebook. "## " headings inside an entry become
+        "### ". Returns notebook_chars, limit, free_chars, trimmed (dropped headings), truncated.
 
         Args:
             entry: Markdown text: hypotheses, results with numbers, dead ends, next steps.
         """
-        def run():
-            lab.notebook_append(entry)
-            return {"ok": True, "notebook_chars": len(lab.notebook())}
-        return call("append_notebook", run)
+        return call("append_notebook", lambda: {"ok": True, **lab.notebook_append(entry)})
 
     @beta_tool
     def rewrite_notebook(content: str) -> str:
         """Replace the whole research notebook, e.g. to condense it.
 
-        Keep every conclusion, open hypothesis, dead end and next step that still matters.
+        Keep every conclusion, open hypothesis, dead end and next step that still matters, and
+        keep it well under the limit: undated sections are never trimmed. Returns notebook_chars,
+        limit, free_chars and a warning when little room is left.
 
         Args:
             content: The complete new notebook in Markdown.
         """
-        def run():
-            lab.notebook_rewrite(content)
-            return {"ok": True, "notebook_chars": len(lab.notebook())}
-        return call("rewrite_notebook", run)
+        return call("rewrite_notebook", lambda: {"ok": True, **lab.notebook_rewrite(content)})
 
     tools = [get_lab_status, describe_strategy_space, list_experiments, run_backtest,
              run_optimization, run_baseline, run_robustness, validate_strategy, promote_to_paper,

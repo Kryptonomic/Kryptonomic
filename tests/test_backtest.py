@@ -12,7 +12,7 @@ from fibbot.backtest import (as_spec, backtest, costs_from_cfg, data_period, iso
                              resolve_workers, result_from_trades, rounded, run_strategy)
 from fibbot.config import DEFAULTS, deep_merge
 from fibbot.metrics import equity_stats, trade_stats
-from fibbot.portfolio import simulate_portfolio
+from fibbot.portfolio import marked_curve, simulate_portfolio
 from fibbot.strategy import FibEngine, StrategySpec, warmup_bars
 from fibbot.types import TF_SECONDS, Bars, Costs, Trade
 
@@ -195,10 +195,20 @@ class TestBacktest(unittest.TestCase):
         pf = simulate_portfolio(r.trades, self.cfg["portfolio"])
         self.assertEqual(r.portfolio, pf)
         self.assertEqual(r.period, (self.start, self.end))
-        curve = [(self.start, pf.start_equity)] + pf.curve + [(self.end, pf.final_equity)]
+        # F19: the account statistics use the mark-to-market curve (open positions marked at
+        # every bar close), not only the realized exits
+        costs = costs_from_cfg(self.cfg)
+        marked = marked_curve(pf, self.bars, costs.fee_rate, costs.slippage, self.end)
+        curve = [(self.start, pf.start_equity)] + marked + [(self.end, pf.final_equity)]
         want = {**trade_stats(closed), **equity_stats(curve, pf.start_equity),
                 "n_open": len(r.trades) - len(closed)}
         self.assertEqual(r.metrics, want)
+        self.assertEqual((r.equity_curve, r.equity_basis), (curve, "marked"))
+        self.assertGreater(len(marked), len(pf.curve))
+        self.assertAlmostEqual(marked[-1][1], pf.final_equity, places=6)
+        realized = [(self.start, pf.start_equity)] + pf.curve + [(self.end, pf.final_equity)]
+        self.assertNotEqual(equity_stats(realized, pf.start_equity)["max_drawdown"],
+                            r.metrics["max_drawdown"])
         self.assertEqual(r.metrics["n_days"], self.end // 86400 - self.start // 86400 + 1)
 
     def test_per_symbol_and_per_year(self):

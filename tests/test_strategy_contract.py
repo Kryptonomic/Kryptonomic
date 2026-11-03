@@ -123,11 +123,12 @@ class EngineCase(unittest.TestCase):
     def close(self, a, b, msg=None):
         self.assertAlmostEqual(a, b, delta=1e-9, msg=msg)
 
-    def check_trade(self, tr, *, side, leg, entry_i, entry, stop, fills, reason):
-        """fills: [(frac, price, bar_idx)] exit fills; for an open trade the last one is the mark."""
+    def check_trade(self, tr, *, side, leg, entry_i, entry, stop, fills, reason, risk=None):
+        """fills: [(frac, price, bar_idx)] exit fills; for an open trade the last one is the mark.
+        risk: expected risk_pct (default |entry - stop| / entry)."""
         fp = [(f, p) for f, p, _ in fills]
         ret = (long_ret if side == 1 else short_ret)(fp, entry)
-        risk = abs(entry - stop) / entry
+        risk = abs(entry - stop) / entry if risk is None else risk
         last_i = fills[-1][2]
         self.assertEqual((tr.side, tr.leg_id, tr.symbol, tr.tf), (side, leg, "TESTUSDT", "1h"))
         self.assertEqual(tr.entry_t, t(entry_i))
@@ -174,7 +175,7 @@ DESIGN_DEFAULTS = dict(
     trend_ema=200, adx_min=0.0, require_structure=False, entry_zone_lo=0.618, entry_zone_hi=0.65,
     entry_mode="limit", entry_at="mid", confirm_type="reclaim", confirm_window=6,
     stop_ratio=0.886, stop_atr_buffer=0.25, tp1_ext=1.0, tp1_frac=0.5, tp2_ext=1.618,
-    move_stop_to_be=True, trail_atr=0.0, max_hold_bars=120, min_rr=1.5)
+    move_stop_to_be=True, trail_atr=0.0, max_hold_bars=120, min_rr=1.5, min_stop_cost_mult=0.0)
 
 CHOICES = {"timeframe": ["1h", "4h", "1d"], "direction": ["long", "short", "both"],
            "swing_mode": ["atr", "pct"], "trend_filter": ["none", "ema", "ema_slope", "ema_stack"],
@@ -195,6 +196,7 @@ BOUNDS = [
     ("confirm_window", [1, 50], [0, 51]),
     ("max_hold_bars", [1, 2000], [0, 2001]),
     ("min_rr", [0.0, 10.0], [-0.01, 10.01]),
+    ("min_stop_cost_mult", [0.0, 20.0], [-0.01, 20.01]),
 ]
 
 
@@ -279,17 +281,25 @@ class TestStrategySpec(unittest.TestCase):
             StrategySpec.from_dict({"bogus": 1})
 
     def test_spec_id(self):
-        """spec_id(): 10 hex chars, sha1 of canonical JSON of to_dict() minus "name"."""
+        """spec_id(): 10 hex chars, sha1 of canonical JSON of to_dict() minus "name"; a field added
+        after the first release (min_stop_cost_mult) is left out while it holds its default, so
+        the ids of specs that do not use it never change."""
         s = StrategySpec()
         sid = s.spec_id()
         self.assertRegex(sid, r"^[0-9a-f]{10}$")
         self.assertEqual(s.with_overrides(name="other").spec_id(), sid)
         self.assertNotEqual(s.with_overrides(min_rr=2.0).spec_id(), sid)
         self.assertEqual(StrategySpec.from_dict(s.to_dict()).spec_id(), sid)
-        d = {k: v for k, v in s.to_dict().items() if k != "name"}
-        candidates = {hashlib.sha1(json.dumps(d, sort_keys=True, separators=sep).encode())
-                      .hexdigest()[:10] for sep in (None, (",", ":"))}
-        self.assertIn(sid, candidates)
+
+        def sha(d):
+            return {hashlib.sha1(json.dumps(d, sort_keys=True, separators=sep).encode())
+                    .hexdigest()[:10] for sep in (None, (",", ":"))}
+
+        d = {k: v for k, v in s.to_dict().items() if k not in ("name", "min_stop_cost_mult")}
+        self.assertIn(sid, sha(d))
+        s3 = s.with_overrides(min_stop_cost_mult=3.0)
+        self.assertNotEqual(s3.spec_id(), sid)
+        self.assertIn(s3.spec_id(), sha({**d, "min_stop_cost_mult": 3.0}))
 
     def test_with_overrides(self):
         """with_overrides(**kw) returns a new spec; the original is unchanged."""
@@ -490,10 +500,20 @@ class TestLimitLong(EngineCase):
                          fills=[(1.0, 97.0 * (1 - SLIP), 34)], reason="open")
 
     def test_limit_touch_boundary(self):
-        """Long limit fills if l[i] <= px: low == 100 fills, low 100.01 does not."""
-        tr = self.only_open(run(setup_rows() + [NO_FILL, (104.0, 105.0, 100.0, 101.0)]))
+        """Long limit fills if l[i] <= px * (1 - limit_through) (default 2bp): a bare touch
+        (low == 100) or a low inside the margin does not fill, low 99.98 fills at 100;
+        limit_through == 0 restores fill-on-touch."""
+        lt = Costs().limit_through
+        self.assertGreater(lt, 0)
+        for low in (100.0, 100.0 * (1 - lt / 2), 100.01):
+            with self.subTest(low=low):
+                self.assert_flat(run(setup_rows() + [NO_FILL, (104.0, 105.0, low, 101.0)]))
+        tr = self.only_open(run(setup_rows() + [NO_FILL, (104.0, 105.0, 100.0 * (1 - lt), 101.0)]))
         self.close(tr.entry_price, 100.0)
-        self.assert_flat(run(setup_rows() + [NO_FILL, (104.0, 105.0, 100.01, 101.0)]))
+        touch = Costs(FEE, SLIP, 0.0)
+        tr = self.only_open(run(setup_rows() + [NO_FILL, (104.0, 105.0, 100.0, 101.0)], costs=touch))
+        self.close(tr.entry_price, 100.0)
+        self.assert_flat(run(setup_rows() + [NO_FILL, (104.0, 105.0, 100.01, 101.0)], costs=touch))
 
     def test_open_trade_marked_at_last_close(self):
         """open_trade: exit_t None, exit_reason "open", marked at c[-1] with exit slippage and
@@ -518,8 +538,10 @@ class TestEntryBar(EngineCase):
         rows = ENTERED[:-1] + [(88.0, 89.0, 85.0, 86.0)]
         self.assertEqual(pivots(rows), [("L", A, J)])
         tr = self.only_trade(run(rows))
+        # risk_pct is the order's planned risk (100 - 90) / 100: |88 - 90| / 88 would be the
+        # distance on the wrong side of the stop
         self.check_trade(tr, side=1, leg=LEG, entry_i=34, entry=88.0, stop=90.0,
-                         fills=[(1.0, 88.0 * (1 - SLIP), 34)], reason="stop")
+                         fills=[(1.0, 88.0 * (1 - SLIP), 34)], reason="stop", risk=0.1)
 
     def test_entry_bar_range_hits_stop(self):
         """Entry bar: l[i] <= stop -> exit at stop*(1-slippage), reason "stop", same bar."""
@@ -536,11 +558,14 @@ class TestEntryBar(EngineCase):
             with self.subTest(open=o):
                 self.assertEqual(o * (1 + SLIP) > 90.0, o == 89.97)
                 tr = self.only_trade(run(touch + [(o, 91.0, 85.0, 86.0)], entry_mode="confirm"))
+                # R against the planned risk of the market order placed at c[34] = 103
                 self.check_trade(tr, side=1, leg=LEG, entry_i=35, entry=o * (1 + SLIP), stop=90.0,
-                                 fills=[(1.0, o * (1 - SLIP), 35)], reason="stop")
+                                 fills=[(1.0, o * (1 - SLIP), 35)], reason="stop",
+                                 risk=(103.0 - 90.0) / 103.0)
 
     def test_targets_never_credited_on_entry_bar(self):
-        """Targets are never credited on the entry bar (high 125 >= tp1 120 on the fill bar)."""
+        """The entry bar's high/low may precede the fill: a target its high reached is not
+        credited when the bar closes back below it (high 125 >= tp1 120, close 110)."""
         tr = self.only_open(run(ENTERED[:-1] + [(101.0, 125.0, 99.0, 110.0),
                                                 (110.0, 115.0, 105.0, 112.0)]))
         self.check_trade(tr, side=1, leg=LEG, entry_i=34, entry=100.0, stop=90.0,
@@ -1234,8 +1259,8 @@ class TestManagePosition(EngineCase):
         self.check(out, 1, 90.0, [(1.0, 90.0 * (1 - SLIP))], "stop", 1)
 
     def test_open_and_no_entry_bar_target(self):
-        """No target credit on the entry bar; still open at the last bar -> "open": true,
-        marked at c[-1]*(1-slippage)."""
+        """No target credit on the entry bar when it closes below the target; still open at the
+        last bar -> "open": true, marked at c[-1]*(1-slippage)."""
         b = make_bars([(100.0, 125.0, 99.0, 110.0), (110.0, 115.0, 105.0, 112.0)])
         out = manage_position(b, [2.0, 2.0], 0, 1, 100.0, 90.0, 120.0, 140.0, spec(), COSTS)
         self.assertTrue(out["open"])

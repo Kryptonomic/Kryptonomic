@@ -6,8 +6,11 @@ from fibbot.types import Trade
 
 DAY = 86400
 D0 = 1_704_067_200          # 2024-01-01 00:00:00 UTC
+# max_total_notional is raised above what these fixtures can reach (3 x 0.5): the tests below
+# are about the other rules; the no-leverage cap (default 1x) has its own tests
 PCFG = {"starting_equity": 10000.0, "risk_per_trade": 0.01, "max_open_positions": 3,
-        "max_total_risk": 0.05, "max_notional_frac": 0.5, "daily_loss_limit": 0.02}
+        "max_total_risk": 0.05, "max_notional_frac": 0.5, "daily_loss_limit": 0.02,
+        "max_total_notional": 2.0}
 
 
 def cfg(**kw):
@@ -66,7 +69,7 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(reasons(res), [("D", "max_open")])
 
     def test_max_total_risk(self):
-        pc = cfg(max_total_risk=0.025, max_open_positions=10)
+        pc = cfg(max_total_risk=0.025, max_open_positions=10, max_total_notional=10.0)
         trades = [mk(D0, D0 + 100, 0.0, symbol="A"), mk(D0 + 1, D0 + 100, 0.0, symbol="B"),
                   mk(D0 + 2, D0 + 100, 0.0, symbol="C"),                     # 3 x 100 > 250
                   mk(D0 + 3, D0 + 100, 0.0, risk_pct=0.001, symbol="D")]     # capped: 5000*0.001 = 5
@@ -115,13 +118,21 @@ class LimitsTest(unittest.TestCase):
 
 
 class OrderingTest(unittest.TestCase):
-    def test_exits_before_entries_at_equal_timestamps(self):
-        pc = cfg(max_open_positions=1)
+    def test_entries_before_exits_at_equal_timestamps(self):
+        # F41: B's order was placed at the close of the bar before D0+3600, when A still held the
+        # only slot; A's exit happened somewhere inside B's fill bar. B cannot use A's slot or
+        # A's profit (the old exits-first order did both).
         a = mk(D0, D0 + 3600, 0.10, symbol="A")
         b = mk(D0 + 3600, D0 + 7200, 0.0, risk_pct=0.04, symbol="B")
-        res = simulate_portfolio([b, a], pc)
+        res = simulate_portfolio([b, a], cfg(max_open_positions=1))
+        self.assertEqual(reasons(res), [("B", "max_open")])
+        res = simulate_portfolio([b, a], cfg(max_open_positions=2))
         self.assertEqual(res.skipped, [])
-        self.assertAlmostEqual(res.taken[1]["notional"], 0.01 * 10500.0 / 0.04)  # sized after A's exit
+        self.assertAlmostEqual(res.taken[1]["notional"], 0.01 * 10000.0 / 0.04)  # before A's +500
+        c = mk(D0 + 7200, D0 + 9000, 0.0, risk_pct=0.04, symbol="C")           # the bar after
+        res = simulate_portfolio([b, a, c], cfg(max_open_positions=1))
+        self.assertEqual([r["trade"].symbol for r in res.taken], ["A", "C"])
+        self.assertAlmostEqual(res.taken[1]["notional"], 0.01 * 10500.0 / 0.04)
 
     def test_same_bar_exit_holds_slot_during_that_timestamp(self):
         pc = cfg(max_open_positions=1)

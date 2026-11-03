@@ -19,7 +19,7 @@ from fibbot.config import DEFAULTS, deep_merge
 from fibbot.data.candles import CandleStore
 from fibbot.lab import NOTEBOOK_HEADER, TRUNCATED, BudgetExceeded, Lab, iso_time
 from fibbot.store import Store
-from fibbot.strategy import PRESETS
+from fibbot.strategy import ENGINE_VERSION, PRESETS
 from fibbot.types import TF_SECONDS, Bars, Signal, Trade
 
 T0 = 1_600_041_600            # 2020-09-14 00:00 UTC
@@ -88,11 +88,18 @@ def mk_signal(sid, symbol, leg, t):
     return Signal(sid, symbol, "4h", 1, leg, t, 100.0, 98.0, 104.0, 106.0, {"rr": 2.0})
 
 
-def record_validation(store, spec, passed=True, avg_r=0.3, checks=(), now_t=None):
-    """A validate experiment as Lab.validate would store it (independent of gate outcomes)."""
+def record_validation(store, spec, passed=True, avg_r=0.3, checks=(), now_t=None, baseline=True):
+    """A validate experiment as Lab.validate would store it (independent of gate outcomes), by
+    the current engine version; with `baseline` also the research-window baseline experiment
+    (an edge over random entries) that Lab.promote requires."""
+    if baseline:
+        store.add_experiment("baseline", spec.to_dict(), spec.spec_id(), T0, T0 + 50 * H4,
+                             {"edge_r": 0.2, "edge_regime_r": 0.1, "n_runs": 10,
+                              "engine_version": ENGINE_VERSION}, now_t=now_t)
     return store.add_experiment("validate", spec.to_dict(), spec.spec_id(), T0, T0 + 100 * H4,
                                 {"passed": passed, "checks": list(checks), "avg_r": avg_r, "n": 40,
-                                 "profit_factor": 1.5, "deflated_sharpe": 0.97}, now_t=now_t)
+                                 "profit_factor": 1.5, "deflated_sharpe": 0.97,
+                                 "engine_version": ENGINE_VERSION}, now_t=now_t)
 
 
 class LabCase(unittest.TestCase):
@@ -194,12 +201,19 @@ class TestResearchCalls(LabCase):
         with self.assertRaisesRegex(ValueError, "no cached 4h candles"):
             self.lab.backtest(SPEC, symbols=["NODATAUSDT"])
 
-    def test_non_research_windows_are_not_trials(self):
-        for window in ("validation", "all"):
+    def test_non_research_windows_are_holdout_peeks(self):
+        # A look at the held-out period is a trial (it used to be free: F16) and its numbers are
+        # kept out of the experiment's top-level metrics, which the brain's tools list.
+        for k, window in enumerate(("validation", "all"), 1):
             out = self.lab.backtest(SPEC, window=window)
-            self.assertEqual(out["window"], window)
-            self.assertEqual(self.store.get_experiment(out["experiment_id"])["notes"], f"window={window}")
-        self.assertEqual(self.store.trial_stats()["n"], 0)
+            self.assertEqual((out["window"], out["holdout_looks"]), (window, k))
+            exp = self.store.get_experiment(out["experiment_id"])
+            self.assertTrue(exp["notes"].startswith(f"window={window}"))
+            self.assertEqual(exp["source"], "cli-holdout")
+            self.assertNotIn("avg_r", exp["metrics"])
+            self.assertEqual(exp["metrics"]["holdout"]["result"]["avg_r"], out["metrics"]["avg_r"])
+            self.assertEqual(self.store.trial_stats()["n"], k)        # the spec, then a 2nd distinct look
+        self.assertEqual(self.store.trial_stats()["var_sharpe"], 0.0)
         with self.assertRaises(ValueError):
             self.lab.backtest(SPEC, window="future")
 
@@ -231,11 +245,13 @@ class TestResearchCalls(LabCase):
                 self.lab.backtest(spec)
         self.assertEqual(bt.call_count, 4)      # specs[2] was cached, specs[0] had been evicted
 
-    def test_optimize_records_every_combo_as_a_trial(self):
+    def test_optimize_records_every_distinct_combo_as_a_trial(self):
+        # F55: a combo whose trades duplicate an earlier one's is evaluated but is not another
+        # trial; on these legs min_rr 1.0 and 1.5 trade identically
         grid = {"min_rr": [1.0, 1.5], "stop_atr_buffer": [0.1, 0.3]}
         out = self.lab.optimize(SPEC, grid)
-        self.assertEqual((out["n_combos"], out["n_evaluated"]), (4, 4))
-        self.assertEqual(self.store.trial_stats()["n"], 4)
+        self.assertEqual((out["n_combos"], out["n_evaluated"], out["n_duplicates"]), (4, 4, 2))
+        self.assertEqual(self.store.trial_stats()["n"], 4 - out["n_duplicates"])
         exp = self.store.get_experiment(out["experiment_id"])
         self.assertEqual((exp["kind"], exp["spec_id"]), ("optimize", SPEC.spec_id()))
         self.assertEqual(exp["metrics"]["avg_r"], out["oos"]["avg_r"])
@@ -247,7 +263,8 @@ class TestResearchCalls(LabCase):
         out = self.lab.robustness(SPEC)
         n = min(len(research.neighbours(SPEC)), lab_mod.ROBUSTNESS_NEIGHBOURS)
         self.assertEqual((out["n"], out["spec_id"]), (n, SPEC.spec_id()))
-        self.assertEqual(self.store.trial_stats()["n"], n)
+        self.assertEqual(n, len(research.neighbours(SPEC)))          # the whole neighbourhood
+        self.assertEqual(self.store.trial_stats()["n"], out["n_distinct"])   # F55: no-op moves are not trials
         self.assertEqual(self.store.get_experiment(out["experiment_id"])["kind"], "robustness")
 
     def test_validate_records_gate_and_counts_itself_as_a_trial(self):
@@ -329,7 +346,8 @@ class TestBudget(LabCase):
         lab = self.make_lab(research={"max_backtest_units_per_cycle": 40})
         lab.begin_cycle("research")
         out = lab.robustness(SPEC)
-        self.assertEqual(lab.budget()["backtest_units_left"], 40 - out["n"])
+        # one unit per neighbour plus one for the base spec (evaluated to spot no-op moves)
+        self.assertEqual(lab.budget()["backtest_units_left"], 40 - out["n"] - 1)
 
     def test_validation_window_is_locked_inside_a_cycle(self):
         self.lab.begin_cycle("research")
@@ -397,7 +415,7 @@ class TestPromoteRetire(LabCase):
         with self.assertRaisesRegex(ValueError, r"roster is full \(1/1\)"):
             self.promote(OTHER, "gp")
 
-    def test_retire_and_reactivate(self):
+    def test_retire_is_final(self):
         record_validation(self.store, SPEC)
         sid = self.promote()["strategy_id"]
         with self.assertRaises(KeyError):
@@ -409,14 +427,21 @@ class TestPromoteRetire(LabCase):
         self.assertIn("drawdown too deep", self.store.journal(kind="retirement")[0]["body"])
         with self.assertRaisesRegex(ValueError, "already retired"):
             self.lab.retire(sid, "again")
-        self.assertEqual(self.promote(now_t=self.NOW + 10 * H4)["roster_size"], 1)   # re-activated
-        self.assertEqual(self.store.get_strategy(sid)["status"], "paper")
+        # A retired id cannot be re-promoted (it used to be re-activated with a fresh account,
+        # erasing a losing paper record and re-drawing it; see store.add_to_roster).
+        with self.assertRaisesRegex(ValueError, r"retired .*drawdown too deep.*final"):
+            self.promote(now_t=self.NOW + 10 * H4)
+        self.assertEqual(self.store.get_strategy(sid)["status"], "retired")
 
     def test_real_validation_then_promotion(self):
         lab = self.make_lab(research={"validation_gate": {"min_deflated_sharpe": 0.0, "min_profit_factor": 1.0,
-                                                          "min_expectancy_r": 0.0}})
+                                                          "min_expectancy_r": 0.0,
+                                                          "min_validation_edge_z": None}})
         v = lab.validate(SPEC)
         self.assertTrue(v["passed"], v["gate"])
+        with self.assertRaisesRegex(ValueError, "no research-window baseline"):
+            lab.promote(SPEC, "deep", "validated", now_t=self.NOW)
+        lab.baseline(SPEC)
         self.assertEqual(lab.promote(SPEC, "deep", "validated", now_t=self.NOW)["validation_experiment_id"],
                          v["experiment_id"])
 
@@ -443,7 +468,10 @@ class TestStatus(LabCase):
         self.assertEqual(st["as_of"], iso_time(self.now))
         self.assertEqual(st["universe"], SYMS)
         self.assertEqual(st["data"], {"4h": {"symbols": 3, "start": "2020-09-14",
-                                             "end": iso_time(T0 + 2000 * H4)}})
+                                             "end": iso_time(T0 + 2000 * H4),
+                                             "oldest_end": iso_time(T0 + 2000 * H4),
+                                             "oldest_symbol": "S0USDT",
+                                             "oldest_lag_bars": round((self.now - T0) / H4 - 2000, 1)}})
         w = self.lab.windows("4h")
         self.assertEqual(st["windows"]["4h"]["validation"],
                          [iso_time(w["validation_start"])[:10], iso_time(w["validation_end"])[:10]])
@@ -460,7 +488,8 @@ class TestStatus(LabCase):
         self.assertEqual(st["roster_slots"], {"paper": 1, "max": 4})
         self.assertEqual(st["experiments"]["backtest"], 1)
         self.assertEqual(st["experiments"]["validate"], 1)
-        self.assertEqual(st["experiments"]["total"], 2)
+        self.assertEqual(st["experiments"]["baseline"], 1)       # record_validation's research baseline
+        self.assertEqual(st["experiments"]["total"], 3)
         self.assertEqual(st["trial_stats"]["n"], 1)
         self.assertEqual(st["last"], {"research": iso_time(self.NOW), "review": None, "sweep": None})
         self.assertEqual((st["cycle"], st["budget"]["backtest_units_left"]), (None, None))
@@ -569,13 +598,23 @@ class TestNotebook(LabCase):
         self.assertTrue(text.endswith(TRUNCATED + "\n"))
         self.assertNotIn("\nold\n", text)
 
-    def test_the_newest_entry_is_always_kept(self):
+    def test_a_full_notebook_refuses_the_entry_instead_of_dropping_condensed_text(self):
+        # This used to write an empty truncated entry and leave the notebook over its limit; the
+        # condensed preamble is never dropped, so the brain is asked to rewrite_notebook.
         self.lab = self.make_lab(brain={"notebook_max_chars": 100})
         self.lab.notebook_rewrite("p" * 80)                  # a preamble that leaves no room
-        self.lab.notebook_append("hello", now_t=T0)
+        before = self.lab.notebook()
+        with self.assertRaisesRegex(ValueError, "notebook full.*rewrite_notebook"):
+            self.lab.notebook_append("hello", now_t=T0)
+        self.assertEqual(self.lab.notebook(), before)
+
+    def test_the_newest_entry_is_always_kept(self):
+        self.lab = self.make_lab(brain={"notebook_max_chars": 120})
+        for k in range(5):
+            out = self.lab.notebook_append(f"entry {k} " + "q" * 40, now_t=T0 + k * 60)
+            self.assertLessEqual(out["notebook_chars"], 120)
         text = self.lab.notebook()
-        self.assertIn("p" * 80, text)
-        self.assertTrue(text.endswith(f"\n## {iso_time(T0)}\n{TRUNCATED}\n"), text)
+        self.assertTrue(text.endswith(f"\n## {iso_time(T0 + 240)}\nentry 4 {'q' * 40}\n"), text)
 
     def test_rewrite_adds_the_header_and_enforces_the_limit(self):
         self.lab = self.make_lab(brain={"notebook_max_chars": 100})

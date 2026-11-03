@@ -8,7 +8,7 @@ from unittest import mock
 from fibbot import research as rs
 from fibbot.backtest import as_spec, result_from_trades, rounded
 from fibbot.config import DEFAULTS
-from fibbot.metrics import deflated_sharpe, trade_stats
+from fibbot.metrics import clustered_t_stat, deflated_sharpe, effective_n, entry_week, trade_stats
 from fibbot.research import (compute_windows, evaluate, fold_bounds, fold_stats, neighbours,
                              random_baseline, robustness, validation_gate, walk_forward_optimize,
                              window_bounds)
@@ -148,7 +148,6 @@ class TestRandomBaseline(Universe):
             b = self.run_baseline(n_runs=3, seed=5)
         trades = self.res.closed_trades
         self.assertEqual(len(calls), 3 * len(trades))
-        slip = self.cfg["costs"]["slippage"]
         for j, ((bars, atr_w, e, side, px, stop, tp1, tp2, spec, costs), _) in enumerate(calls):
             tr = trades[j % len(trades)]
             w = self.bars[tr.symbol].window(self.start, self.end, warmup_bars(SPEC))
@@ -156,7 +155,9 @@ class TestRandomBaseline(Universe):
             self.assertEqual(w.index_at_or_after(self.start), warmup_bars(SPEC))
             self.assertTrue(warmup_bars(SPEC) <= e < len(w) - 1)
             self.assertEqual(side, tr.side)
-            self.assertAlmostEqual(px, w.o[e] * (1 + side * slip))
+            # F20: SPEC is limit mode, whose fills pay no slippage: neither does the baseline
+            self.assertEqual(SPEC.entry_mode, "limit")
+            self.assertEqual(px, w.o[e])
             self.assertAlmostEqual(abs(px - stop) / px, tr.risk_pct)
             self.assertEqual(side * (px - stop) > 0, True)
             risk = abs(tr.entry_price - tr.stop_price)
@@ -183,7 +184,11 @@ class TestRandomBaseline(Universe):
                                self.start, self.end)
         self.assertEqual(none, {"n_trades": 0, "n_runs": 10, "seed": 1, "strategy_avg_r": 0.0,
                                 "baseline_avg_r_mean": 0.0, "baseline_avg_r_std": 0.0,
-                                "beats_frac": 0.0, "runs": [], "edge_r": 0.0})
+                                "beats_frac": 0.0, "runs": [], "edge_r": 0.0,
+                                "strategy_se": 0.0, "edge_se": 0.0, "edge_z": 0.0,
+                                "regime_filtered": False, "baseline_regime_avg_r_mean": 0.0,
+                                "baseline_regime_avg_r_std": 0.0, "edge_regime_r": 0.0,
+                                "edge_regime_z": 0.0})
 
 
 # Scripted walk-forward: fold k spans [T0 + k*D, T0 + (k+1)*D); trades of each grid value per fold.
@@ -294,7 +299,15 @@ class TestWalkForwardReal(Universe):
         seen = []
         out = walk_forward_optimize(SPEC, grid, self.bars, self.cfg, self.w,
                                     on_combo=lambda s, r: seen.append(r.spec_id))
-        self.assertEqual((out["n_combos"], out["n_evaluated"], len(seen)), (4, 4, 4))
+        # F55: on these legs min_rr 2.0 never binds, so each stop_ratio's min_rr=2.0 combo trades
+        # exactly like its min_rr=1.0 combo: evaluated and ranked, but not another trial
+        self.assertEqual((out["n_combos"], out["n_evaluated"], out["n_duplicates"], len(seen)),
+                         (4, 4, 2, 2))
+        for sr in (0.786, 1.0):
+            a, b = (rs.backtest(SPEC.with_overrides(stop_ratio=sr, min_rr=v), self.bars,
+                                self.w["research_start"], self.w["research_end"], self.cfg)
+                    for v in (1.0, 2.0))
+            self.assertEqual(rs.trades_key(a), rs.trades_key(b))
         self.assertLess(len(dumps(out)), 12000)
         best = out["best"]
         self.assertEqual(as_spec(best["spec"]).spec_id(), best["spec_id"])
@@ -333,7 +346,7 @@ class TestNeighbours(unittest.TestCase):
                                   "setup_expiry_bars", "trend_filter", "trend_ema", "adx_min",
                                   "entry_zone_lo", "entry_zone_hi", "entry_mode", "entry_at",
                                   "stop_ratio", "stop_atr_buffer", "tp1_ext", "tp1_frac", "tp2_ext",
-                                  "trail_atr", "max_hold_bars", "min_rr"})
+                                  "trail_atr", "max_hold_bars", "min_rr", "min_stop_cost_mult"})
         for k, v in moves:
             p, old = PARAM_SPACE[k], getattr(base, k)
             if p["type"] == "choice":
@@ -379,19 +392,28 @@ class TestNeighbours(unittest.TestCase):
 
 class TestRobustness(Universe):
     def test_rows_and_aggregates(self):
+        # F36: the default evaluates the WHOLE one-step neighbourhood (both directions of every
+        # movable parameter), not an evenly spaced subset of 16
         seen = []
         out = robustness(SPEC, self.bars, self.cfg, self.w, on_combo=lambda s, r: seen.append(s))
         cands = neighbours(SPEC)
-        self.assertEqual((out["n"], out["n_candidates"]), (16, len(cands)))
-        picked = [cands[i * len(cands) // 16] for i in range(16)]
-        self.assertEqual(seen, picked)
-        self.assertEqual([r["spec_id"] for r in out["rows"]], [s.spec_id() for s in picked])
-        for row, nb in zip(out["rows"], picked):
+        self.assertGreater(len(cands), 16)
+        self.assertEqual((out["n"], out["n_candidates"]), (len(cands), len(cands)))
+        self.assertEqual([r["spec_id"] for r in out["rows"]], [s.spec_id() for s in cands])
+        for row, nb in zip(out["rows"], cands):
             self.assertEqual(getattr(nb, row["param"]), row["value"])
-        avg = [r["avg_r"] for r in out["rows"]]
-        self.assertEqual(out["positive_frac"], rounded(sum(a > 0 for a in avg) / 16))
+        self.assertEqual(out["params_untested"], [])
+        self.assertEqual(sum(len(v) for v in out["coverage"].values()), len(cands))
+        # F55: no-op moves (same trades as the base or an earlier neighbour) are flagged, are not
+        # trials and stay out of the aggregates
+        unique = [r for r in out["rows"] if r["duplicate_of"] is None]
+        self.assertEqual((out["n_distinct"], out["n_duplicates"]), (len(unique), len(cands) - len(unique)))
+        self.assertGreater(out["n_duplicates"], 0)
+        self.assertEqual([s.spec_id() for s in seen], [r["spec_id"] for r in unique])
+        avg = [r["avg_r"] for r in unique]
+        self.assertEqual(out["positive_frac"], rounded(sum(a > 0 for a in avg) / len(avg)))
         self.assertEqual(out["worst_avg_r"], min(avg))
-        res, ex = evaluate(picked[3], self.bars, self.cfg, self.w)
+        res, ex = evaluate(cands[3], self.bars, self.cfg, self.w)
         self.assertEqual(out["rows"][3]["n"], res.metrics["n"])
         self.assertEqual(out["rows"][3]["fold_positive_frac"], ex["fold_positive_frac"])
         dumps(out)
@@ -399,8 +421,15 @@ class TestRobustness(Universe):
     def test_subset_sizes(self):
         cands = neighbours(SPEC)
         out = robustness(SPEC, self.bars, self.cfg, self.w, max_neighbours=3)
-        self.assertEqual([r["spec_id"] for r in out["rows"]],
-                         [cands[i * len(cands) // 3].spec_id() for i in range(3)])
+        picked = rs._pick_neighbours(SPEC, cands, 3)
+        self.assertEqual([r["spec_id"] for r in out["rows"]], [nb.spec_id() for nb in picked])
+        self.assertLessEqual(out["n"], 3)
+        moves = {}
+        for nb in cands:
+            moves.setdefault(rs._moved_param(SPEC, nb), []).append(nb.spec_id())
+        tested = {r["spec_id"] for r in out["rows"]}
+        for param, ids in moves.items():            # a parameter is tested both ways or not at all
+            self.assertIn(len(tested & set(ids)), (0, len(ids)), param)
         out = robustness(SPEC, self.bars, self.cfg, self.w, max_neighbours=0)
         self.assertEqual((out["n"], out["positive_frac"], out["median_avg_r"], out["worst_avg_r"],
                           out["rows"]), (0, 0.0, 0.0, 0.0, []))
@@ -427,12 +456,21 @@ class TestValidationGate(unittest.TestCase):
         self.assertEqual(list(c), ["min_trades", "min_profit_factor", "min_expectancy_r",
                                    "min_deflated_sharpe", "max_drawdown", "min_symbol_win_frac"])
         rs_ = [t.r_multiple for t in res.closed_trades]
-        self.assertEqual(out["deflated_sharpe"], rounded(deflated_sharpe(rs_, 5, 0.02)))
+        # F09: the sample size is the effective number of trades (clustered by UTC entry week)
+        weeks = [entry_week(t.entry_t) for t in res.closed_trades]
+        n_eff = effective_n(rs_, weeks)
+        self.assertLessEqual(n_eff, len(rs_))
+        self.assertEqual(out["deflated_sharpe"], rounded(deflated_sharpe(rs_, 5, 0.02, n_eff=n_eff)))
+        self.assertEqual((out["n_eff"], out["t_clustered"]),
+                         (rounded(n_eff), rounded(clustered_t_stat(rs_, weeks))))
         self.assertEqual((c["min_trades"]["value"], c["min_profit_factor"]["value"],
                           c["min_expectancy_r"]["value"], c["min_symbol_win_frac"]["value"]),
                          (40, 4.0, 0.75, 1.0))
         self.assertEqual(c["max_drawdown"]["value"], rounded(res.metrics["max_drawdown"]))
-        self.assertEqual({k: v["threshold"] for k, v in c.items()}, self.GATE)
+        # without a baseline the edge-over-random checks are not applied
+        self.assertEqual({k: v["threshold"] for k, v in c.items()},
+                         {k: v for k, v in self.GATE.items()
+                          if k not in ("min_validation_edge_r", "min_validation_edge_z")})
 
     def test_each_check_can_fail_alone(self):
         res = self.result()

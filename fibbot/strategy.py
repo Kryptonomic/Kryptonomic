@@ -16,6 +16,15 @@ from . import indicators as ind
 from .fib import Pivot, PivotTracker, extension_price, retrace_price
 from .types import Bars, Costs, Signal, Trade, TF_SECONDS
 
+# Version of the fill/accounting rules. Results (trades, metrics, trial counts) produced under
+# different engine versions are not comparable even for the same spec_id: callers that store or
+# compare results should record it. History:
+#   1  initial engine
+#   2  entry bar credits targets its close is beyond (at the target price); limit entries need a
+#      trade-through of Costs.limit_through; risk_pct of a fill beyond the stop uses the planned
+#      risk; StrategySpec.min_stop_cost_mult.
+ENGINE_VERSION = 2
+
 
 @dataclass
 class StrategySpec:
@@ -52,6 +61,7 @@ class StrategySpec:
     trail_atr: float = 0.0
     max_hold_bars: int = 120
     min_rr: float = 1.5
+    min_stop_cost_mult: float = 0.0
 
     def __post_init__(self):
         for k, p in PARAM_SPACE.items():
@@ -104,9 +114,14 @@ class StrategySpec:
         return cls(**d)
 
     def spec_id(self) -> str:
-        """10 hex chars: sha1 of the canonical JSON of to_dict() without "name"."""
+        """10 hex chars: sha1 of the canonical JSON of to_dict() without "name". Fields added
+        after the first release (_ID_OPTIONAL) are left out while they hold their default, so
+        every spec that does not use them keeps its original id."""
         d = self.to_dict()
         del d["name"]
+        for k, default in _ID_OPTIONAL.items():
+            if d[k] == default:
+                del d[k]
         blob = json.dumps(d, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(blob.encode()).hexdigest()[:10]
 
@@ -117,6 +132,8 @@ class StrategySpec:
 
 
 _FIELD_NAMES = frozenset(f.name for f in fields(StrategySpec))
+# fields that are omitted from the spec_id blob while equal to their default (see spec_id)
+_ID_OPTIONAL = {"min_stop_cost_mult": 0.0}
 
 
 def _check_keys(d: dict) -> None:
@@ -166,7 +183,12 @@ PARAM_SPACE: dict[str, dict] = {
     "trail_atr": _num("float", 0.0, 10.0, 0.5,
                       "after target 1 trail the stop at close -/+ k*ATR (0 disables)"),
     "max_hold_bars": _num("int", 1, 2000, 20, "time stop in bars"),
-    "min_rr": _num("float", 0.0, 10.0, 0.25, "minimum planned (blended) reward/risk"),
+    "min_rr": _num("float", 0.0, 10.0, 0.25, "minimum planned (blended) reward/risk, before costs"),
+    "min_stop_cost_mult": _num("float", 0.0, 20.0, 0.5,
+                               "minimum stop distance (entry - stop)/entry in round-trip costs "
+                               "(2*fee + slippage, + entry slippage in confirm mode); 3 caps the "
+                               "cost drag at 1/3 R: the lever against tight (1h) stops that costs "
+                               "eat, which min_rr cannot filter (0 disables)"),
 }
 for _k, _p in PARAM_SPACE.items():
     _p["default"] = StrategySpec.__dataclass_fields__[_k].default
@@ -207,13 +229,15 @@ class _Position:
     """One open position and the per-bar exit rules. FibEngine and manage_position both drive it
     through intrabar() (fills inside a bar) and at_close() (close-of-bar rules)."""
 
-    __slots__ = ("side", "entry_idx", "entry_px", "init_stop", "stop", "stop_kind", "tp1", "tp2",
-                 "tp1_frac", "be_px", "trail_atr", "max_hold", "slip", "fee", "tp1_hit", "rem",
-                 "fills", "exit_idx", "exit_reason")
+    __slots__ = ("side", "entry_idx", "entry_px", "plan_px", "init_stop", "stop", "stop_kind",
+                 "tp1", "tp2", "tp1_frac", "be_px", "trail_atr", "max_hold", "slip", "fee",
+                 "tp1_hit", "rem", "fills", "exit_idx", "exit_reason", "thru_stop")
 
     def __init__(self, side: int, entry_idx: int, entry_px: float, stop_px: float, tp1: float,
-                 tp2: float, spec: StrategySpec, costs: Costs):
+                 tp2: float, spec: StrategySpec, costs: Costs, plan_px: float | None = None):
         self.side, self.entry_idx, self.entry_px = side, entry_idx, entry_px
+        self.plan_px = plan_px                # the order's price (risk basis if P is beyond the stop)
+        self.thru_stop = False                # the entry filled at or beyond the stop
         self.init_stop = self.stop = stop_px
         self.stop_kind = "stop"               # "stop" -> "breakeven" -> "trail" as the stop moves
         self.tp1, self.tp2, self.tp1_frac = tp1, tp2, spec.tp1_frac
@@ -231,15 +255,30 @@ class _Position:
         self.rem = 0.0
         self.exit_idx, self.exit_reason = i, reason
 
+    def _fill_tp1(self, i: int, t: int, px: float) -> None:
+        """Target 1 fills at px: close tp1_frac (all of it if tp1_frac == 1, reason "target")."""
+        if self.tp1_frac >= 1.0:
+            self._exit(i, t, px, "target", "tp1")
+            return
+        self.fills.append([self.tp1_frac, px, "tp1", t])
+        self.rem = 1.0 - self.tp1_frac
+        self.tp1_hit = True
+        # this bar's stop check already ran, so the breakeven stop acts from the next bar
+        s = self.side
+        if self.be_px is not None and s * (self.be_px - self.stop) > 0:
+            self.stop, self.stop_kind = self.be_px, "breakeven"
+
     def intrabar(self, i: int, t: int, o: float, h: float, l: float) -> None:
-        """Fills inside bar i. The entry bar only checks the stop (worst case, targets never
-        credited); later bars: gap through stop, stop, then tp1 / tp2 (stop before targets)."""
+        """Fills inside bar i. The entry bar only checks the stop here (its high/low may have come
+        before the fill; at_close credits the targets its close proves were crossed); later bars:
+        gap through stop, stop, then tp1 / tp2 (stop before targets)."""
         s, stop = self.side, self.stop
         adverse = l if s > 0 else h
         if i == self.entry_idx:
             # the worse of the open and the fill is the pre-slippage price of the fill
             x = min(o, self.entry_px) if s > 0 else max(o, self.entry_px)
             if s * (x - stop) <= 0:
+                self.thru_stop = True
                 self._exit(i, t, x * (1 - s * self.slip), "stop")
             elif s * (adverse - stop) <= 0:
                 self._exit(i, t, stop * (1 - s * self.slip), "stop")
@@ -250,26 +289,34 @@ class _Position:
         if s * (adverse - stop) <= 0:
             self._exit(i, t, stop * (1 - s * self.slip), self.stop_kind)
             return
+        # A target the previous close was already beyond has been filled at its level on that
+        # bar (the entry bar via at_close), so an open beyond a pending target is a true gap.
         fav = h if s > 0 else l
         if not self.tp1_hit:
             if s * (fav - self.tp1) < 0:
                 return
-            px = o if s * (o - self.tp1) > 0 else self.tp1
-            if self.tp1_frac >= 1.0:
-                self._exit(i, t, px, "target", "tp1")
+            self._fill_tp1(i, t, o if s * (o - self.tp1) > 0 else self.tp1)
+            if self.exit_idx is not None:
                 return
-            self.fills.append([self.tp1_frac, px, "tp1", t])
-            self.rem = 1.0 - self.tp1_frac
-            self.tp1_hit = True
-            # this bar's stop check already ran, so the breakeven stop acts from the next bar
-            if self.be_px is not None and s * (self.be_px - self.stop) > 0:
-                self.stop, self.stop_kind = self.be_px, "breakeven"
         if s * (fav - self.tp2) >= 0:
             self._exit(i, t, o if s * (o - self.tp2) > 0 else self.tp2, "target", "tp2")
 
     def at_close(self, i: int, t: int, c: float, atr_i: float) -> None:
-        """Close of bar i: trail the stop after tp1, then the time stop."""
+        """Close of bar i: on the entry bar, credit the targets its close is beyond; trail the stop
+        after tp1, then the time stop."""
         s = self.side
+        if i == self.entry_idx:
+            # The entry bar's high/low may precede the fill, so intrabar() credits no target. But
+            # if the bar closed beyond a target (its range never reached the stop: the position is
+            # still open), price crossed the target after the fill, where a resting target limit
+            # fills AT the target. Credit it now rather than at the next bar's open.
+            if not self.tp1_hit and s * (c - self.tp1) > 0:
+                self._fill_tp1(i, t, self.tp1)
+                if self.exit_idx is not None:
+                    return
+            if self.tp1_hit and s * (c - self.tp2) > 0:
+                self._exit(i, t, self.tp2, "target", "tp2")
+                return
         if self.tp1_hit and self.trail_atr > 0 and not math.isnan(atr_i):
             level = c - s * self.trail_atr * atr_i
             if s * (level - self.stop) > 0:
@@ -285,9 +332,17 @@ class _Position:
             exit_idx, reason = len(c) - 1, "open"
             fills.append([self.rem, c[-1] * (1 - s * self.slip), "open", t[-1]])
         gross = sum(f * p for f, p, _, _ in fills)
-        p0, fee = self.entry_px, self.fee
+        p0, fee, stop = self.entry_px, self.fee, self.init_stop
         ret = gross / p0 * (1 - fee) - (1 + fee) if s > 0 else (1 - fee) - gross / p0 * (1 + fee)
-        risk = abs(p0 - self.init_stop) / p0
+        risk = s * (p0 - stop) / p0
+        if risk <= 0 or self.thru_stop:
+            # The fill (before entry slippage) landed at or beyond the stop: the bar opened through
+            # it and the position was stopped out at once. The fill-to-stop distance is then on
+            # the wrong side or a sliver, which makes R arbitrary (and sizing absurd), so R is
+            # measured against the order's planned risk.
+            q = self.plan_px
+            planned = s * (q - stop) / q if q else 0.0
+            risk = planned if planned > 0 else abs(p0 - stop) / p0
         return {"exit_idx": exit_idx, "exit_reason": reason, "fills": fills, "exit_price": gross,
                 "ret_pct": ret, "risk_pct": risk, "r_multiple": ret / risk if risk > 0 else 0.0,
                 "open": self.exit_idx is None}
@@ -295,12 +350,14 @@ class _Position:
 
 def manage_position(bars: Bars, atr: list[float], entry_idx: int, side: int, entry_px: float,
                     stop_px: float, tp1: float, tp2: float, spec: StrategySpec, costs: Costs,
-                    start_mgmt_idx: int | None = None) -> dict:
+                    start_mgmt_idx: int | None = None, plan_px: float | None = None) -> dict:
     """Manage a position filled at entry_px (incl. slippage) during bar entry_idx with the exact
     exit rules FibEngine uses, from bar start_mgmt_idx (default entry_idx) to the exit or the last
-    bar. The entry bar gets the entry-bar stop check; a later start_mgmt_idx skips the bars before
-    it. Returns {"exit_idx", "exit_reason", "fills", "exit_price", "ret_pct", "risk_pct",
-    "r_multiple", "open"}; an open position is marked at the last close."""
+    bar. The entry bar gets the entry-bar stop check and, at its close, the targets its close is
+    beyond; a later start_mgmt_idx skips the bars before it. plan_px (optional) is the order's
+    price: risk_pct uses it when entry_px is at or beyond the stop. Returns {"exit_idx",
+    "exit_reason", "fills", "exit_price", "ret_pct", "risk_pct", "r_multiple", "open"}; an open
+    position is marked at the last close."""
     if side not in (1, -1):
         raise ValueError(f"side must be +1 or -1, got {side!r}")
     if not 0 <= entry_idx < len(bars):
@@ -308,7 +365,7 @@ def manage_position(bars: Bars, atr: list[float], entry_idx: int, side: int, ent
     first = entry_idx if start_mgmt_idx is None else start_mgmt_idx
     if first < entry_idx:
         raise ValueError(f"start_mgmt_idx {first} < entry_idx {entry_idx}")
-    pos = _Position(side, entry_idx, entry_px, stop_px, tp1, tp2, spec, costs)
+    pos = _Position(side, entry_idx, entry_px, stop_px, tp1, tp2, spec, costs, plan_px)
     t, o, h, l, c = bars.t, bars.o, bars.h, bars.l, bars.c
     for i in range(first, len(bars)):
         pos.intrabar(i, t[i], o[i], h[i], l[i])
@@ -319,8 +376,16 @@ def manage_position(bars: Bars, atr: list[float], entry_idx: int, side: int, ent
     return pos.result(t, c)
 
 
+def round_trip_cost(costs: Costs, entry_mode: str) -> float:
+    """Cost of a stopped-out round trip as a fraction of the entry: two fees plus the stop's exit
+    slippage, plus the entry slippage of a market (confirm-mode) fill. min_stop_cost_mult
+    multiplies this."""
+    return 2 * costs.fee_rate + costs.slippage * (2 if entry_mode == "confirm" else 1)
+
+
 def _rr(s: int, entry: float, stop: float, tp1: float, tp2: float, frac: float) -> float:
-    """Planned blended reward/risk of an entry; -inf unless stop < entry < tp1 (long sense)."""
+    """Planned blended reward/risk of an entry, gross of costs (min_stop_cost_mult is the cost
+    check); -inf unless stop < entry < tp1 (long sense)."""
     risk, r1 = s * (entry - stop), s * (tp1 - entry)
     if risk <= 0 or r1 <= 0:
         return -math.inf
@@ -341,12 +406,14 @@ class _Side:
     """The current leg of one direction: anchor pivot, running extreme, liveness, confirm touch."""
 
     __slots__ = ("s", "kind", "tag", "spec", "entry_ratio", "t", "o", "c", "fav", "adv", "atr",
-                 "filt", "rsi", "anchor", "leg_id", "ext", "ext_idx", "worst", "struct_ok",
-                 "active", "armed_t", "touch")
+                 "filt", "rsi", "min_risk", "anchor", "leg_id", "ext", "ext_idx", "worst",
+                 "struct_ok", "active", "armed_t", "touch")
 
     def __init__(self, s: int, spec: StrategySpec, entry_ratio: float, bars: Bars,
-                 atr: list[float], filt: list[bool], rsi: list[float] | None):
+                 atr: list[float], filt: list[bool], rsi: list[float] | None,
+                 min_risk: float = 0.0):
         self.s, self.spec, self.entry_ratio = s, spec, entry_ratio
+        self.min_risk = min_risk              # minimum (entry - stop)/entry (min_stop_cost_mult)
         self.kind, self.tag = ("L", "L") if s > 0 else ("H", "S")
         self.t, self.o, self.c = bars.t, bars.o, bars.c
         self.fav, self.adv = (bars.h, bars.l) if s > 0 else (bars.l, bars.h)
@@ -407,7 +474,7 @@ class _Side:
         tp2 = extension_price(a, ext, sp.tp2_ext)
         entry = retrace_price(a, ext, self.entry_ratio)
         rr = _rr(s, entry, stop, tp1, tp2, sp.tp1_frac)
-        ok = rr >= sp.min_rr
+        ok = rr >= sp.min_rr and self._stop_far_enough(entry, stop)
         zone_top = retrace_price(a, ext, sp.entry_zone_lo)
         signal = order = None
         if ok and self.armed_t is None:
@@ -429,11 +496,15 @@ class _Side:
             self.touch = i
         if self.touch is not None and self._confirmed(i, zone_top):
             rr_c = _rr(s, c_i, stop, tp1, tp2, sp.tp1_frac)
-            if rr_c >= sp.min_rr:
+            if rr_c >= sp.min_rr and self._stop_far_enough(c_i, stop):
                 ratio = (ext - c_i) / (ext - a)
                 order = _Order(self, True, c_i, stop, tp1, tp2,
                                self._meta(ext, leg, atr_i, ratio, tp1, tp2, rr_c))
         return signal, order
+
+    def _stop_far_enough(self, entry: float, stop: float) -> bool:
+        """min_stop_cost_mult: the stop is at least min_risk (a fraction of entry) away."""
+        return self.min_risk <= 0 or self.s * (entry - stop) >= self.min_risk * entry
 
     def _confirmed(self, k: int, zone_top: float) -> bool:
         """Confirmation pattern (spec.confirm_type) at the close of bar k."""
@@ -472,15 +543,26 @@ def _filter_ok(spec: StrategySpec, s: int, c: list[float], ema_t, ema50, adx_v) 
     return ok
 
 
-def _pick_fill(orders: list[_Order], o: float, h: float, l: float, slip: float):
-    """The order that fills in this bar and its fill price: limits fill when the range reaches px
-    (at the open if it gapped through); if several fill, the one priced closest to the open wins."""
+def limit_fills(side: int, px: float, h: float, l: float, through: float) -> bool:
+    """Whether a resting entry limit at px fills in a bar with this high/low: the bar must trade
+    at least `through` (a fraction of px, Costs.limit_through) beyond the price - a bare touch
+    does not fill a queued order (through == 0: a touch fills). Shared by every entry fill."""
+    if side > 0:
+        return l <= px * (1.0 - through)
+    return h >= px * (1.0 + through)
+
+
+def _pick_fill(orders: list[_Order], o: float, h: float, l: float, slip: float,
+               through: float = 0.0):
+    """The order that fills in this bar and its fill price: limits fill when the range trades
+    through px by `through` (limit_fills; at the open if it gapped through); if several fill, the
+    one priced closest to the open wins."""
     best, best_px, best_d = None, 0.0, math.inf
     for od in orders:
         s = od.side.s
         if od.market:
             px, d = o * (1 + s * slip), 0.0
-        elif s * ((l if s > 0 else h) - od.px) <= 0:
+        elif limit_fills(s, od.px, h, l, through):
             px, d = (od.px if s * (o - od.px) > 0 else o), abs(od.px - o)
         else:
             continue
@@ -515,12 +597,14 @@ class FibEngine:
         rsi = ind.rsi(c, 14) if sp.entry_mode == "confirm" and sp.confirm_type == "rsi" else None
         ratio = {"lo": sp.entry_zone_lo, "hi": sp.entry_zone_hi,
                  "mid": (sp.entry_zone_lo + sp.entry_zone_hi) / 2}[sp.entry_at]
-        sides = [_Side(s, sp, ratio, bars, atr, _filter_ok(sp, s, c, ema_t, ema50, adx_v), rsi)
+        min_risk = sp.min_stop_cost_mult * round_trip_cost(self.costs, sp.entry_mode)
+        sides = [_Side(s, sp, ratio, bars, atr, _filter_ok(sp, s, c, ema_t, ema50, adx_v), rsi,
+                       min_risk)
                  for s in (1, -1) if sp.direction in ("both", "long" if s > 0 else "short")]
         tracker = PivotTracker(sp.swing_mult, sp.swing_mode, sp.swing_pct)
         start = -math.inf if trade_start_t is None else trade_start_t
         signal_from = start - TF_SECONDS[sp.timeframe]
-        slip = self.costs.slippage
+        slip, through = self.costs.slippage, self.costs.limit_through
         trades: list[Trade] = []
         signals: list[Signal] = []
         orders: list[_Order] = []
@@ -533,11 +617,11 @@ class FibEngine:
                 if pos is not None:
                     pos.intrabar(i, ti, o[i], h[i], l[i])
                 elif orders:
-                    pos_order, px = _pick_fill(orders, o[i], h[i], l[i], slip)
+                    pos_order, px = _pick_fill(orders, o[i], h[i], l[i], slip, through)
                     if pos_order is not None:
                         pos_order.side.active = False          # the leg is used
                         pos = _Position(pos_order.side.s, i, px, pos_order.stop, pos_order.tp1,
-                                        pos_order.tp2, sp, self.costs)
+                                        pos_order.tp2, sp, self.costs, pos_order.px)
                         pos.intrabar(i, ti, o[i], h[i], l[i])
                 if pos is not None and pos.exit_idx is not None:
                     trades.append(self._trade(bars, pos, pos_order))

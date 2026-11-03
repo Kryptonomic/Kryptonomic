@@ -12,7 +12,8 @@ from fibbot.autopilot import MIN_FOLD_POSITIVE, TOP_VALIDATE, sweep
 from fibbot.strategy import PRESETS
 from tests.test_lab import LabCase
 
-PERMISSIVE_GATE = {"min_deflated_sharpe": 0.0, "min_profit_factor": 1.0, "min_expectancy_r": 0.0}
+PERMISSIVE_GATE = {"min_deflated_sharpe": 0.0, "min_profit_factor": 1.0, "min_expectancy_r": 0.0,
+                   "min_validation_edge_z": None}   # synthetic random walks: no significant edge
 FOUR_H = [name for name, spec in PRESETS.items() if spec.timeframe == "4h"]
 
 
@@ -126,9 +127,16 @@ class TestSweep(SweepCase):
 class StubLab:
     """Lab stand-in with crafted research numbers per preset: (n, avg_r, fold_positive_frac, edge_r)."""
 
-    def __init__(self, store, cfg, numbers, passing=()):
+    def __init__(self, store, cfg, numbers, passing=(), prior=None, weekly_left=None):
         self.store, self.cfg, self.numbers, self.passing = store, cfg, numbers, set(passing)
         self.validated, self.promoted = [], []
+        self.prior, self.weekly_left = dict(prior or {}), weekly_left   # preset -> validate experiment
+
+    def weekly_validations_left(self):
+        return self.weekly_left
+
+    def prior_validation(self, spec):
+        return self.prior.get(spec.name)
 
     def backtest(self, spec, window):
         n, avg_r, folds, _ = self.numbers[spec.name]

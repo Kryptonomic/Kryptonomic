@@ -3,7 +3,9 @@
 render_status() is compact terminal text; write_report() writes home/REPORT.md, Markdown that reads
 well on GitHub and on a phone. Both show the same lab state: roster and paper accounts, graduation
 checks, recent paper trades, the value of the brain's signal reviews, the latest research and
-review journal entries and the head of the brain notebook.
+review journal entries (clipped at line boundaries), system events (journal kind "system":
+scheduler step failures, paper-integrity warnings) and graduation changes (kind "graduation"), so an
+unattended bot's failures are visible, and the head of the brain notebook.
 """
 from __future__ import annotations
 
@@ -12,12 +14,16 @@ from pathlib import Path
 
 from .config import home_path
 from .data.candles import atomic_write
-from .lab import NOTEBOOK_HEADER, Lab
+from .lab import NOTEBOOK_HEADER, Lab, iso_time
 
 DISCLAIMER = "Paper trading only: fibbot never places real orders. Nothing here is financial advice."
 RECENT_TRADES = 15
 JOURNAL_ENTRIES = 3
 JOURNAL_BODY_CHARS = 800
+EVENT_ENTRIES = 5              # newest system events (errors, warnings) / graduation changes listed
+STALE_BARS = 3                 # candles more than this many bars old are stale (as scheduler.STALE_BARS)
+DB_WARN_BYTES = 50_000_000     # GitHub rejects files over 100 MB; the Actions save step refuses over 95 MB
+EVENT_BODY_CHARS = 300
 NOTEBOOK_LINES = 60
 REVIEW_GROUPS = ("take", "skip", "unreviewed")
 
@@ -46,8 +52,72 @@ def _table(header: list[str], rows: list[list], right: set[int] = frozenset()) -
 
 
 def _clip(text: str, n: int) -> str:
+    """text cut to about n chars at a line boundary, with "[... k more lines]" for dropped
+    lines; a first line longer than n is cut with " [...]"."""
     text = text.strip()
-    return text if len(text) <= n else text[:n].rstrip() + " [...]"
+    if len(text) <= n:
+        return text
+    lines, keep, used = text.splitlines(), [], 0
+    for ln in lines:
+        if used + len(ln) > n:
+            break
+        keep.append(ln)
+        used += len(ln) + 1
+    if not keep:
+        return text[:n].rstrip() + " [...]"
+    rest = len(lines) - len(keep)
+    return "\n".join(keep) + f"\n[... {rest} more line{'' if rest == 1 else 's'}]"
+
+
+def _events(lab: Lab, kind: str) -> list[dict]:
+    """Newest EVENT_ENTRIES journal entries of kind (e.g. "system", "graduation")."""
+    return lab.store.journal(EVENT_ENTRIES, kind)
+
+
+def _db_bytes(lab: Lab) -> int:
+    """Size of the SQLite database (plus its WAL), 0 for an in-memory store."""
+    path = getattr(lab.store, "path", None)
+    total = 0
+    for p in ([path, f"{path}-wal"] if path and path != ":memory:" else []):
+        try:
+            total += Path(p).stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _alerts(lab: Lab, st: dict) -> list[str]:
+    """Problems an unattended run must show first: a candle stall (kv data_stall, written by the
+    scheduler), a timeframe a roster strategy trades whose oldest per-symbol candles lag by more
+    than STALE_BARS bars, and a database approaching GitHub's 100 MB file limit."""
+    out = []
+    stall = st.get("data_stall")
+    if isinstance(stall, dict) and stall.get("since") is not None:
+        out.append(f"STALE DATA since {_iso(stall['since'])}: {stall.get('reason', '')}")
+    used = {e["timeframe"] for e in st.get("roster", [])}
+    for tf, d in sorted((st.get("data") or {}).items()):
+        lag = d.get("oldest_lag_bars")
+        if tf in used and isinstance(lag, (int, float)) and lag > STALE_BARS:
+            out.append(f"STALE CANDLES: {d.get('oldest_symbol')} {tf} ends {d.get('oldest_end')}"
+                       f" ({lag:.0f} bars behind)")
+    size = _db_bytes(lab)
+    if size > DB_WARN_BYTES:
+        out.append(f"DATABASE {size / 1e6:.0f} MB: GitHub rejects files over 100 MB and the Actions"
+                   " save step refuses over 95 MB (the scheduler compacts old detail daily)")
+    return out
+
+
+def _iso(t) -> str:
+    try:
+        return iso_time(int(t))
+    except (TypeError, ValueError):
+        return str(t)
+
+
+def _errors_line(st: dict) -> str:
+    e = st.get("system_events_7d") or {"n": 0, "last": None, "last_t": None}
+    return (f"system events (errors, warnings) last 7 days: {e['n']}"
+            + (f"; last {e['last_t']}: {e['last']}" if e["n"] else ""))
 
 
 def _notebook_head(lab: Lab) -> list[str]:
@@ -116,8 +186,12 @@ def _budget_line(st: dict) -> str:
 def _activity_line(st: dict) -> str:
     ts, ex, last = st["trial_stats"], st["experiments"], st["last"]
     kinds = ", ".join(f"{k} {v}" for k, v in ex.items() if k != "total" and v)
+    v7 = st.get("validations_7d")
     return (f"trials {ts['n']} (var Sharpe {_f(ts['var_sharpe'])}); experiments {ex['total']}"
             + (f" ({kinds})" if kinds else "")
+            + (f"; validations last 7 days {v7['used']}/{'-' if v7['cap'] is None else v7['cap']}"
+               if v7 else "")
+            + (f"; CLI holdout peeks {st['holdout_peeks']}" if st.get("holdout_peeks") else "")
             + f"; last research {last['research'] or '-'}, review {last['review'] or '-'},"
               f" sweep {last['sweep'] or '-'}")
 
@@ -127,6 +201,7 @@ def render_status(lab: Lab, now_t: int | None = None) -> str:
     st = lab.status(now_t=now_t)
     slots = st["roster_slots"]
     lines = [f"fibbot status {st['as_of']} | signal review: {st['signal_review']}", DISCLAIMER,
+             *(f"!! {a}" for a in _alerts(lab, st)),
              *_data_lines(st), f"roster {slots['paper']}/{slots['max']} paper slots:"]
     for e in st["roster"]:
         a, g = e["account"], e["graduation"]
@@ -148,7 +223,7 @@ def render_status(lab: Lab, now_t: int | None = None) -> str:
                  + " | ".join(f"{g} n {rv[g]['n']}" + (f" mean R {rv[g]['avg_r']:+.2f}" if rv[g]["n"] else "")
                               for g in REVIEW_GROUPS)
                  + f" | skip-take {_f(rv['skip_minus_take_avg_r'], '{:+.2f}')}")
-    lines += [_activity_line(st), _budget_line(st)]
+    lines += [_errors_line(st), _activity_line(st), _budget_line(st)]
     lines += [f"{_when(j['t'])} {j['kind']}: {j['title']}" for j in _research_journal(lab)[:1]]
     return "\n".join(lines)
 
@@ -157,7 +232,14 @@ def _markdown(lab: Lab, st: dict, now_t: int | None) -> str:
     slots, names = st["roster_slots"], _names(lab)
     md = ["# fibbot report", "",
           f"**As of** {st['as_of']} · {len(st['universe'])} coins · signal review: {st['signal_review']}",
-          "", f"> **{DISCLAIMER}**", "", f"## Paper roster ({slots['paper']}/{slots['max']} slots)", ""]
+          "", f"> **{DISCLAIMER}**", ""]
+    for alert in _alerts(lab, st):
+        md += [f"**{_cell(alert)}**", ""]
+    errs = st.get("system_events_7d") or {}
+    if errs.get("n"):
+        md += [f"**{errs['n']} system event{'' if errs['n'] == 1 else 's'} (errors, warnings) in the last"
+               f" 7 days** (newest {errs['last_t']}: {_cell(errs['last'])}); see Recent system events.", ""]
+    md += [f"## Paper roster ({slots['paper']}/{slots['max']} slots)", ""]
     if st["roster"]:
         md += _table(["Strategy", "TF", "Days", "Closed / open", "Mean R", "PF", "Return", "Max DD", "Graduation"],
                      [[f"{e['name']} `{e['strategy_id']}`", e["timeframe"], *_account_cells(e),
@@ -174,6 +256,10 @@ def _markdown(lab: Lab, st: dict, now_t: int | None) -> str:
         g = lab.graduation(e["strategy_id"], now_t=now_t)
         md += ["", f"### {e['name']} · {g['status']}", "", g["summary"], "",
                *(_check_line(c) for c in g["checks"])]
+    changes = _events(lab, "graduation")
+    md += ["", f"### Graduation changes (last {EVENT_ENTRIES})", ""]
+    md += ([f"- {_when(j['t'])} UTC · {_cell(j['title'])}" for j in changes] if changes
+           else ["_No graduation changes yet._"])
 
     trades = lab.store.paper_trades(limit=RECENT_TRADES)
     md += ["", f"## Recent paper trades (last {RECENT_TRADES})", ""]
@@ -200,6 +286,12 @@ def _markdown(lab: Lab, st: dict, now_t: int | None) -> str:
                *(f"> {line}" for line in _clip(j["body"], JOURNAL_BODY_CHARS).splitlines())]
     if not entries:
         md += ["", "_No research or review entries yet._"]
+
+    errors = _events(lab, "system")
+    md += ["", f"## Recent system events (last {EVENT_ENTRIES})", "", _errors_line(st)]
+    for j in errors:
+        md += ["", f"- **{_when(j['t'])} UTC** · {_cell(j['title'])}",
+               *(f"  > {line}" for line in _clip(j["body"], EVENT_BODY_CHARS).splitlines())]
 
     md += ["", f"## Brain notebook (first {NOTEBOOK_LINES} lines)", ""]
     md += [f"> {ln}" for ln in _notebook_head(lab)] or ["_Empty._"]

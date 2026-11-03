@@ -26,7 +26,7 @@ from fibbot.scheduler import (ATTEMPT_KEY, AUTO_RETIRE_FACTOR, CYCLE_RETRY_HOURS
                               research_due, review_due, run_forever, run_once, setup_logging)
 from fibbot.store import Store
 from fibbot.strategy import PRESETS
-from fibbot.types import Trade
+from fibbot.types import TF_SECONDS, Bars, Trade
 from tests.test_lab import SYMS, FakeCandles as LabCandles, make_cfg as lab_cfg
 
 NOW = 1_700_000_000
@@ -58,13 +58,26 @@ class FakeBrain:
 
 
 class FakeCandles:
+    """update_all "fails" for BADUSDT only; get serves one bar per (symbol, tf) that ends at
+    `ends.get((symbol, tf), self.end)` (None = no bars), fresh at NOW by default."""
+
     def __init__(self, lab):
-        self.lab, self.last_errors = lab, {}
+        self.lab, self.last_errors, self.end, self.ends, self.errors = lab, {}, NOW, {}, None
 
     def update_all(self, symbols, tfs):
         self.lab.record("update_all", list(symbols), list(tfs))
+        if self.errors is not None:          # e.g. every request answered HTTP 451
+            self.last_errors = {(s, tf): self.errors for s in symbols for tf in tfs}
+            return {}
         self.last_errors = {("BADUSDT", "4h"): "boom"}
         return {(s, tf): 2 for s in symbols for tf in tfs}
+
+    def get(self, symbol, tf):
+        end = self.ends.get((symbol, tf), self.end)
+        if end is None:
+            return Bars(symbol, tf)
+        t = end - TF_SECONDS[tf]
+        return Bars.from_rows(symbol, tf, [(t, 1.0, 1.0, 1.0, 1.0, 1.0)])
 
 
 class FakePaper:
@@ -456,14 +469,19 @@ class TestGraduationStep(SchedulerCase):
                          {"statuses": {"s1": "promising"}, "retired": [], "failed": 0})
         self.assertEqual(self.store.get_kv(GRADUATION_KEY.format("s1"))["status"], "promising")
 
-    def test_reactivated_strategy_starts_a_fresh_status_history(self):
+    def test_a_status_of_another_paper_run_is_not_carried_over(self):
+        # The store no longer re-activates a retired id (retirement is final), so a status
+        # recorded for an earlier paper run (another paper_start_t) stands in for one here.
+        self.add("s0")
+        self.store.set_strategy_status("s0", "retired")
+        with self.assertRaises(ValueError):
+            self.add("s0", start=NOW - 86400)
         self.add()
-        self.go()
-        self.store.set_strategy_status("s1", "retired")
-        self.add(start=NOW - 86400)
+        self.store.set_kv(GRADUATION_KEY.format("s1"),
+                          {"status": "promising", "paper_start_t": NOW - 99 * 86400, "t": NOW - 86400})
         self.go()
         self.assertEqual([j["title"] for j in self.graduation_journal()],
-                         ["name-s1 (s1) is collecting"] * 2)
+                         ["name-s1 (s1) is collecting"])
 
     def test_auto_retire_beyond_the_drawdown_limit(self):
         limit = AUTO_RETIRE_FACTOR * self.cfg["graduation"]["max_drawdown"]
@@ -615,12 +633,15 @@ class TestRealLab(unittest.TestCase):
                 mock.patch.dict("sys.modules", {"anthropic": None}):
             cfg = lab_cfg(home, research={"validation_gate": {"min_deflated_sharpe": 0.0,
                                                               "min_profit_factor": 1.0,
-                                                              "min_expectancy_r": 0.0}},
+                                                              "min_expectancy_r": 0.0,
+                                                              "min_validation_edge_z": None}},
                           paper={"max_roster": 1})
             store, candles = Store(Path(home) / "fibbot.sqlite"), Candles()
             self.addCleanup(store.close)
             lab = Lab(cfg, store, candles)
-            out = run_once(cfg, lab=lab, use_brain=False)
+            # "now" is just after the synthetic history (a later clock would be a candle stall)
+            now = max(int(b.t[-1]) for b in candles.bars.values()) + TF_SECONDS["4h"] + 90
+            out = run_once(cfg, lab=lab, use_brain=False, now_t=now)
             st = {s["step"]: s for s in out["steps"]}
             self.assertEqual({k for k, v in st.items() if v["status"] == "failed"}, set(), out)
             self.assertEqual(len(st["autopilot"]["detail"]["promoted"]), 1)
@@ -629,7 +650,7 @@ class TestRealLab(unittest.TestCase):
             self.assertTrue((Path(home) / "REPORT.md").read_text().startswith("# fibbot report"))
             self.assertEqual(store.journal(kind="research")[0]["title"][:15], "Autopilot sweep")
 
-            out = run_once(cfg, lab=lab, use_brain=False)
+            out = run_once(cfg, lab=lab, use_brain=False, now_t=now + 3600)
             st = {s["step"]: s for s in out["steps"]}
             self.assertEqual(st["paper"]["status"], "ok", out)
             self.assertEqual(st["graduation"]["detail"]["statuses"], {sid: "collecting"})
