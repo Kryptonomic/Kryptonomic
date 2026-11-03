@@ -1,4 +1,4 @@
-# fibbot user guide (draft)
+# fibbot user guide
 
 fibbot is a bot that **paper trades** Fibonacci-retracement setups on the largest crypto coins by
 market cap. It tests many versions of the strategy on past prices, keeps only those that pass
@@ -677,4 +677,90 @@ them makes "reliably profitable" mean less.
 
 ## Research results
 
-_Pending first research run._
+### First research run, 2026-11-03: nothing passed
+
+**Bottom line:** fibbot has not found a reliably profitable Fibonacci strategy yet, so nothing is
+paper trading. One candidate had strong research numbers, but it lost money in the locked
+validation year.
+
+**Setup**
+- Coins: the top 12 by market cap on 2026-11-03 (BTC, ETH, BNB, XRP, SOL, TRX, ZEC, DOGE,
+  LINK, ADA, XLM, BCH).
+- Candles: 1h, 4h and 1d, 2020-01-01 to 2026-11-03.
+- Costs: the defaults (0.1% fee and 0.05% slippage per side).
+- Research window: 2020-01-01 to 2025-11-02.
+- Validation year: 2025-11-02 to 2026-11-03, locked. It is scored on the coins that were top 12 on
+  2025-11-02, so XLM and BCH are replaced by AVAX and SUI.
+
+**How the research was done**
+- Four research agents did the brain's job through the CLI on the research window only. Each took
+  one family:
+  1. shallow, trend-aligned pullbacks;
+  2. exit design;
+  3. confirmation entries, regime filters and shorts;
+  4. costs and leg size on 1h.
+- The store recorded 355 trials, so the multiple-testing count is honest.
+- Three judges (overfitting, regime and recency, mechanism and costs) re-ran every candidate. Every
+  reported number reproduced exactly.
+- Only one candidate got the judges' votes, so only one of the three weekly validation looks was
+  used.
+
+**Candidates.** "Edge" is the avg R above random entries with the same side, risk and exits, on
+both random draws (uniform / same regime), with z-scores: 50 random runs for the first two
+rows, 10 for the rest. The timeframe is 4h unless the idea says otherwise.
+
+| spec | idea | research trades | avg R | edge (z) | 2022 / 2024 / 2025 avg R | judges |
+|---|---|---|---|---|---|---|
+| `aa47d5f033` | `shallow_trend_4h` + `require_structure` + `entry_at: mid` + ADX 25 + `ema_slope` | 566 | +0.295 | +0.25 (3.1) / +0.23 (2.8) | +0.04 / +0.08 / +0.19 | 3 of 3: validate |
+| `72e8b44f2e` | same rule with `ema_stack` | 488 | +0.311 | +0.26 (3.0) / +0.22 (2.5) | +0.14 / +0.13 / +0.15 | 0 of 3: shares 93-96% of trades with the first, so it is the same bet |
+| `213150f1f1` | `golden_pocket_4h`, no trend filter, ADX 25, structure | 529 | +0.268 | +0.22 (2.2) / +0.19 (1.9) | -0.00 / +0.06 / +0.00 | 0 of 3: decayed; walk-forward out-of-sample +0.01 |
+| `8fe000ae40` | `golden_pocket_1h`, `min_stop_cost_mult` 10, `min_leg_atr` 6 (1h) | 1064 | +0.155 | +0.17 (2.1) / +0.15 (1.8) | -0.12 / +0.25 / +0.04 | 0 of 3: cost-fragile, 71% of R in 2020-21 |
+| `22cd5281c9` | `ext_runner_4h` on 1d, trail 4 ATR (1d) | 208 | +0.763 | +0.31 (1.4) / +0.37 (1.7) | -0.92 / +0.89 / +0.16 | 0 of 3: mostly market drift plus a few big winners |
+
+**Validation of `aa47d5f033` (one look, failed)**
+- 82 trades, avg -0.22 R, profit factor 0.65, max drawdown 6.9%.
+- Edge over random entries -0.20 R (z -1.38).
+- 4 of 12 coins and 1 of 4 quarters positive.
+- It failed 6 of the 8 checks: profit factor, expectancy, deflated Sharpe, symbol win fraction and
+  both edge checks.
+
+The other two variants of the same idea were deliberately not validated. Picking them after seeing
+this result would be fitting to the validation year.
+
+**What was learned** (details and numbers are in the notebook)
+- **The presets as shipped do not beat random entries.** For example, `golden_pocket_4h` beats
+  random by 0.02 R and `shallow_trend_4h` by 0.09 R (z 1.5). Most of their raw profit is the
+  2020-2021 bull market.
+- **Timing edge came from filters.** A higher-low anchor (`require_structure`), a strong trend
+  (ADX at least 25) and a slightly deeper limit inside the shallow zone added the edge. It held in
+  research, not in the validation year.
+- **Exits did not create an edge on 4h.** Looser trails and bigger targets raise random entries
+  just as much.
+- **Losing ideas:** deep zones (0.786 and deeper), confirmation entries on 4h, and shorts. Shorts
+  only made money in 2022, and both directions together is always below long-only.
+- **1h needs a cost filter and stays fragile.** It only works with `min_stop_cost_mult` around 10,
+  which really selects high-volatility legs.
+- **One validation year has low power.** At about 80 trades a year, an edge needs a research z of
+  about 4 to have a good chance of passing the year. That is why ideas with more trades are worth
+  more.
+
+**Disclosure.** Before this store existed, the code review ran all 8 presets on the same
+validation year in throwaway stores. All 8 failed; the best was `golden_pocket_4h` at about
++0.005 R. The research agents and judges were not told this. The lead, who picked the validation
+process, knew it. The store's trial and look counts do not include those throwaway runs.
+
+**What happens next**
+- With an empty roster the hourly loop keeps researching weekly: the brain if an API key is set,
+  otherwise the deterministic autopilot.
+- Validation stays capped at 3 looks a week and one look per spec per period.
+- The validation year slides forward as new candles arrive, until the first promotion pins it.
+- Forward paper trading is the only fully fresh test once something passes.
+- The brain notebook from this run is in
+  [`research/2026-11-03-brain-notebook.md`](research/2026-11-03-brain-notebook.md). For a new
+  deployment, copy it to `$FIBBOT_HOME/BRAIN_NOTEBOOK.md` so the brain does not repeat the dead
+  ends.
+- The notebook's open ideas:
+  - structure + ADX 25 on the 1h cost-filtered base;
+  - the shallow structure rule on 1h;
+  - the same rule without a trend filter;
+  - a market-wide (BTC) regime gate, which needs a code change.

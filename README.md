@@ -32,3 +32,6 @@ python -m fibbot run                # hourly paper trading and research
 The core of fibbot is standard library only; `requirements.txt` is needed only for the brain.
 To run it unattended, use the `Dockerfile` or the GitHub Actions workflow
 `.github/workflows/fibbot-paper.yml` (both described in FIBBOT.md).
+
+Status: the first research run (2026-11-03) found no strategy that passes the validation year,
+so nothing is paper trading yet. See [Research results](FIBBOT.md#research-results).
